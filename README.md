@@ -114,6 +114,30 @@ Semantics worth knowing:
   `repo` scope) — `python control.py doctor` verifies both and shows each
   repo's PR target. `EC_GH_EXE` overrides gh discovery if needed.
 
+## GitHub visibility (automatic README + repo description)
+
+A second tick phase (`ghdocs.docs_sync`) keeps each repo's `README.md` and
+its GitHub repo description current. When validated work is published (kv
+`pr_pushed` advances), a background sonnet "docs" worker runs in an isolated
+worktree checked out at exactly that published tip. It updates (or bootstraps
+a missing) `README.md` against what the code actually does now, and proposes
+a one-line repo description. The controller then:
+
+- accepts the commit only if the diff touches `README.md` alone and leaks no
+  secrets (mechanical whitelist — a docs worker can never change code);
+- cherry-picks it onto `automation/integration` (same idempotent `-x`
+  provenance path as step promotion, serialized behind in-flight
+  validations) and advances `pr_tip`, so the normal PR push carries it. The
+  pushed tip stays test-green by construction: byte-identical code to an
+  already-validated tip, README-only delta;
+- PATCHes the repo description via `gh api` when it changes.
+
+Cost/safety: one docs worker in flight globally, background capacity class
+(never steals a roadmap slot), 6h per-repo cooldown (a missing README skips
+the cooldown), no dispatch while paused. A rejected commit is discarded and
+that tip is never retried — the next validated tip triggers a fresh attempt.
+Worker or GitHub failures notify once, back off, and never pause development.
+
 ## Recovery
 
 There is nothing to do manually. Every dispatch has a deterministic key and
