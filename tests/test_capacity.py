@@ -520,5 +520,83 @@ class TestGovernorPolicy(Base):
         self.assertEqual((g["tier"], g["override"]), ("max20", None))
 
 
+class TestResetRolloverAndForce(Base):
+    """Owner findings 2026-08-10: (a) a window whose known reset time has
+    passed must stop counting against pressure the very next tick — not 45
+    minutes later when staleness kicks in; (b) the /go override pushes a
+    READY step through the pressure hold without weakening model caps."""
+
+    VIEW = {"tier": "max20", "confidence": "confirmed",
+            "auth_mode": "subscription", "billing_overrides": []}
+
+    def row(self, pct5=91, reset5_in=3600, pct7=25, reset7_in=86400):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO telemetry(ts,session_id,source,fetched_at,pct5,"
+                "reset5,pct7,reset7) VALUES(?,?,?,?,?,?,?,?)",
+                (common.now(), "s", "statusline", common.now(), pct5,
+                 common.iso_in(reset5_in), pct7, common.iso_in(reset7_in)))
+
+    def test_future_reset_keeps_pressure(self):
+        self.row(pct5=91, reset5_in=600)
+        u = cap.current_usage(self.conn)
+        self.assertFalse(u["rolled5"])
+        self.assertEqual(u["pct5"], 91)
+        self.assertEqual(cap.pressure_level(u), "very_high")
+
+    def test_past_reset_voids_the_window_immediately(self):
+        self.row(pct5=91, reset5_in=-60, pct7=25)
+        u = cap.current_usage(self.conn)
+        self.assertTrue(u["rolled5"])
+        self.assertIsNone(u["pct5"])
+        self.assertFalse(u["stale"], "fresh row: rollover is not staleness")
+        self.assertEqual(cap.pressure_level(u), "plenty")
+        g = cap.governor(self.ctx, self.conn, self.VIEW, u, 1)
+        self.assertIn("start", g["allowed"])
+        self.assertTrue(cap.can_dispatch(self.ctx, self.conn, g, "planner",
+                                         "fable", new_step=True))
+
+    def test_past_reset_7d_window(self):
+        self.row(pct5=10, pct7=93, reset7_in=-60)
+        u = cap.current_usage(self.conn)
+        self.assertTrue(u["rolled7"])
+        self.assertIsNone(u["pct7"])
+        self.assertEqual(cap.pressure_level(u), "plenty")
+
+    def test_garbage_reset_never_voids(self):
+        self.row(pct5=91)
+        with self.conn:
+            self.conn.execute("UPDATE telemetry SET reset5='not-a-date'")
+        u = cap.current_usage(self.conn)
+        self.assertFalse(u["rolled5"])
+        self.assertEqual(u["pct5"], 91)
+
+    def test_usage_text_shows_rollover(self):
+        self.row(pct5=91, reset5_in=-60)
+        t = cap.usage_text(cap.current_usage(self.conn))
+        self.assertIn("5h ?", t)
+        self.assertIn("fresh start", t)
+        self.assertEqual(cap.usage_text(None), "usage: no telemetry yet")
+
+    def test_forced_bypasses_pressure_not_model_caps(self):
+        usage = {"pct5": 75, "pct7": 10, "fetched_at": common.now(),
+                 "age_min": 0.1, "stale": False}
+        g = cap.governor(self.ctx, self.conn, self.VIEW, usage, 1)
+        self.assertNotIn("start", g["allowed"])
+        self.assertFalse(cap.can_dispatch(self.ctx, self.conn, g, "planner",
+                                          "fable", new_step=True))
+        self.assertTrue(cap.can_dispatch(self.ctx, self.conn, g, "planner",
+                                         "fable", new_step=True, forced=True))
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO runs(key,step_id,role,model,status,created_at)"
+                " VALUES('f1','s1','planner','fable','DISPATCHED',?)",
+                (common.now(),))
+        self.assertFalse(
+            cap.can_dispatch(self.ctx, self.conn, g, "planner", "fable",
+                             new_step=True, forced=True),
+            "forced must still respect the fable cap")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

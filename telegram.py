@@ -24,7 +24,8 @@ SETUP_HELP = (
 )
 
 COMMANDS = ("/status", "/workers", "/pause", "/resume", "/retry", "/abort",
-            "/log", "/profile", "/pace", "/prs", "/why", "/news", "/help", "/start")
+            "/go", "/log", "/profile", "/pace", "/prs", "/why", "/news",
+            "/help", "/start")
 
 
 class Telegram:

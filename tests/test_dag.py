@@ -273,6 +273,58 @@ steps:
                           c.execute("SELECT state FROM steps")), 240),
             self.sb.states())
 
+    def test_hold_is_announced_once_and_go_forces_through(self):
+        """Owner finding 2026-08-10: a pressure-held READY step must say so
+        (once per reset window) and /go must push it through immediately."""
+        for _ in range(3):
+            self.sb.tick()
+            time.sleep(0.1)
+        self.assertEqual(self.sb.states(), {"A": "PENDING", "B": "PENDING"})
+        conn = self.sb.conn()
+        holds = conn.execute(
+            "SELECT key,text FROM notifications WHERE key LIKE 'hold:A:%'"
+        ).fetchall()
+        self.assertEqual(len(holds), 1, "one hold notice per step per window")
+        self.assertIn("/go A", holds[0]["text"])
+        self.assertIn("held by usage pressure", holds[0]["text"])
+
+        sent = []
+
+        class T:
+            def send(self, t):
+                sent.append(t)
+
+        control.handle_commands(self.sb.ctx(), conn, T(), ["/go A"])
+        self.assertIn("A", sent[-1])
+        self.assertEqual(db.kv_get(conn, "force_start:A"), "1")
+        conn.close()
+        self.assertTrue(self.sb.run_until(
+            lambda c: self.sb.step_row(c, "A")["state"] != "PENDING", 60),
+            self.sb.states())
+        self.assertEqual(self.sb.state("B"), "PENDING",
+                         "unforced sibling stays held")
+        conn = self.sb.conn()
+        self.assertEqual(db.kv_get(conn, "force_start:A"), "",
+                         "force flag is one-shot")
+        conn.close()
+
+    def test_window_reset_releases_the_hold_without_fresh_telemetry(self):
+        """The 5h reset moment is known (reset5): when it passes, the old
+        percentage stops gating starts on the NEXT tick — no 45-minute wait
+        for staleness, no interactive session required."""
+        for _ in range(3):
+            self.sb.tick()
+            time.sleep(0.1)
+        self.assertEqual(self.sb.states(), {"A": "PENDING", "B": "PENDING"})
+        conn = self.sb.conn()
+        with conn:  # the wall clock crosses the recorded reset time
+            conn.execute("UPDATE telemetry SET reset5=?", (common.iso_in(-30),))
+        conn.close()
+        self.assertTrue(self.sb.run_until(
+            lambda c: all(s["state"] != "PENDING" for s in
+                          c.execute("SELECT state FROM steps")), 90),
+            self.sb.states())
+
     def test_quota_holds_all_dispatch_and_recovers(self):
         self.sb.set_capacity(tier="max20", pct5=10, pct7=5)
         self.sb.set_script({"A.implementer.1": "quota", "B.planner": "hang"})
