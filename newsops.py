@@ -39,11 +39,29 @@ TASKS = {
 }
 COLLECTORS = ("stocks", "web", "youtube")
 
+# Aliases the owner can type -> canonical DISCOVERY_PROVIDER values, plus how
+# each engine is described back. PROVIDER_MODELS mirrors the product's
+# config.DEFAULT_MODELS for display only — the product picks its own default.
+PROVIDER_CANON = {
+    "claude": "claude_chat", "claude_chat": "claude_chat",
+    "chatgpt": "openai", "gpt": "openai", "openai": "openai",
+    "anthropic": "anthropic",
+}
+PROVIDER_LABELS = {
+    "claude_chat": "Claude via claude.ai session",
+    "openai": "ChatGPT via OpenAI API",
+    "anthropic": "Claude via Anthropic API",
+}
+PROVIDER_MODELS = {"claude_chat": "claude-opus-5", "anthropic": "claude-opus-5",
+                   "openai": "gpt-5"}
+PROVIDER_NEEDS_KEY = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+
 HELP = (
     "/news (or /news status) — appliance health, tasks, pending sends\n"
     "/news run stocks|web|youtube|all — collect now\n"
     "/news run digest — send pending discovery items now\n"
     "/news config — current settings + notify bars\n"
+    "/news set provider claude|chatgpt|anthropic  (AI engine for search + scoring)\n"
     "/news set digest_time HH:MM\n"
     "/news set digest_max N          (items per digest)\n"
     "/news set stocks|web|youtube <every: 45m|2h|1h30m>\n"
@@ -107,8 +125,16 @@ def _int_range(lo, hi):
     return check
 
 
+def _provider(v: str) -> str:
+    canon = PROVIDER_CANON.get((v or "").strip().lower())
+    if canon is None:
+        raise NewsError(f"'{v}' is not an engine — claude, chatgpt or anthropic")
+    return canon
+
+
 # key -> (env var, validator, triggers must be re-registered?)
 ENV_KEYS = {
+    "provider": ("DISCOVERY_PROVIDER", _provider, False),
     "digest_time": ("DISCOVERY_DIGEST_TIME", _hhmm, True),
     "digest_max": ("DISCOVERY_DIGEST_MAX", _int_range(1, 50), False),
     "stocks": ("DISCOVERY_INTERVAL_STOCKS", _interval, True),
@@ -118,6 +144,7 @@ ENV_KEYS = {
 }
 
 ENV_DEFAULTS = {
+    "DISCOVERY_PROVIDER": "claude_chat",
     "DISCOVERY_DIGEST_TIME": "08:00", "DISCOVERY_DIGEST_MAX": "10",
     "DISCOVERY_INTERVAL_STOCKS": "3600", "DISCOVERY_INTERVAL_WEB": "14400",
     "DISCOVERY_INTERVAL_YOUTUBE": "14400", "DISCOVERY_MAX_SCORES": "25",
@@ -207,8 +234,11 @@ def run(ctx, what: str) -> str:
 
 def config_text(ctx) -> str:
     env = _env_read(ctx)
+    prov = env["DISCOVERY_PROVIDER"]
     lines = [
         "⚙️ news config",
+        f"engine: {prov} — {PROVIDER_LABELS.get(prov, '?')}"
+        f" · model {env.get('DISCOVERY_MODEL') or PROVIDER_MODELS.get(prov, '?')}",
         f"digest {env['DISCOVERY_DIGEST_TIME']} daily"
         f" · max {env['DISCOVERY_DIGEST_MAX']} items"
         f" · ≤{env['DISCOVERY_MAX_SCORES']} LLM calls/cycle",
@@ -254,6 +284,19 @@ def config_set(ctx, key: str = "", *vals) -> str:
                 f"`python ops\\install_tasks.py --install` manually: {out.strip()[:200]}")
     else:
         msg += " (takes effect next run)"
+    if key == "provider":
+        env = _env_read(ctx)
+        msg += (f"\nengine: {PROVIDER_LABELS[value]}"
+                f" · model {env.get('DISCOVERY_MODEL') or PROVIDER_MODELS[value]}")
+        need = PROVIDER_NEEDS_KEY.get(value)
+        if need and not env.get(need):
+            msg += (f"\n⚠ {need} is not set in the appliance .env — collections"
+                    " hold at preflight until it is")
+            if value == "openai":
+                msg += " (plus `pip install openai` for the appliance's Python)"
+        if env.get("DISCOVERY_MODEL"):
+            msg += ("\n⚠ DISCOVERY_MODEL is pinned in .env and overrides the"
+                    " engine's default model")
     return msg
 
 

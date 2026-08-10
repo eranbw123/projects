@@ -190,7 +190,12 @@ installed internet-discovery-* tasks (never blocks the tick), config
 show/set. Mutations whitelisted: product .env runtime keys (digest_time/
 digest_max/intervals/max_scores, validated; cadence keys auto re-run
 `--install` because triggers are derived at install time) + interests.json
-`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload). Every
+`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload) +
+`set provider claude|chatgpt|anthropic` → DISCOVERY_PROVIDER (aliases →
+canonical claude_chat/openai/anthropic; warns on missing OPENAI_/
+ANTHROPIC_API_KEY and on a pinned DISCOVERY_MODEL; `config` shows
+engine+model; product-side openai web search landed via the internet repo's
+`chatgpt-web-search` PR — Responses-API web_search tool). Every
 mutated file backed up to product backups/ first; no git ops in the module;
 EC_NEWS_ROOT overrides the product root (tests). tests/test_news.py (14).
 Product deployed same day: PR #9 merged, six tasks installed+verified,
