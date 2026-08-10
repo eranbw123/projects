@@ -1318,8 +1318,11 @@ def on_validating(ctx, conn, roadmap, step, run):
         done = sorted(done + [idx])
         d["done_tasks"] = done
         db.set_detail(conn, step["id"], d)
+        n = d.get("tasks_n", 1)
         tgm.notify(conn, ctx, f"task:{step['id']}:c{d.get('cycle',0)}t{idx}:done",
-                   f"engine-control: {step['id']} task {idx} integrated and validated")
+                   f"engine-control: {step['id']} task {idx} integrated and validated "
+                   f"({len(done)}/{n} tasks"
+                   + ("; step continues)" if len(done) < n else ")"))
     if len(done) < d.get("tasks_n", 1):
         step = db.get_step(conn, step["id"])
         start_task_impl(ctx, conn, roadmap, step, task_idx=len(done))
@@ -1340,11 +1343,7 @@ def status_text(ctx, conn) -> str:
     run_id = db.kv_get(conn, "roadmap_run_id") or "-"
     lines.append(f"engine-control — roadmap {'started' if started else 'NOT started'}"
                  f"{' [PAUSED]' if paused else ''} (run {run_id})")
-    view = json.loads(db.kv_get(conn, "capacity_state") or "{}")
-    usage = cap.current_usage(conn)
-    ready = [s["id"] for s in live_steps(conn) if step_ready(conn, s)]
-    gov = cap.governor(ctx, conn, view, usage,
-                       len([r for r in ready if not db.get_step(conn, r)["background"]]))
+    gov, ready, view, usage = gov_now(ctx, conn)
     mode = "auto" if not gov["override"] else f"override:{gov['override']}"
     lines.append(f"Plan: {TIER_LABEL.get(gov['tier'], gov['tier'])} "
                  f"({mode}, {view.get('confidence', '?')}) · auth {view.get('auth_mode', '?')}")
@@ -1355,7 +1354,9 @@ def status_text(ctx, conn) -> str:
     else:
         lines.append("Usage: no telemetry yet")
     lines.append(f"Claude workers: {gov['active']} active · target {gov['target']}"
-                 f" · pressure {gov['pressure']} · pace {gov['pace']}")
+                 f" · pressure {gov['pressure']} · pace {gov['pace']} (/workers)")
+    if gov["active"] == 0 and started:
+        lines.append(f"   idle — {idle_reason(conn, gov, ready)}")
     prs = [f"{r['k'].split(':', 1)[1]} #{r['v']}" for r in
            conn.execute("SELECT k,v FROM kv WHERE k LIKE 'pr_number:%' AND v!='' "
                         "ORDER BY k")]
@@ -1367,7 +1368,10 @@ def status_text(ctx, conn) -> str:
         d = db.step_detail(s)
         pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
         mark = {"ACCEPTED": "✅", "BLOCKED": "⛔", "ABORTED": "🛑"}.get(s["state"], "·")
-        lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos} — {s['title']}")
+        n = d.get("tasks_n", 0)
+        prog = (f" · task {d.get('task_idx', 0) + 1}/{n}" if n > 1 and s["state"] in
+                ("IMPLEMENTING", "TESTING", "REPAIRING", "REVIEWING", "VALIDATING") else "")
+        lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos}{prog} — {s['title']}")
         if s["state"] == "BLOCKED":
             why = conn.execute(
                 "SELECT reason FROM transitions WHERE step_id=? AND to_state='BLOCKED' "
@@ -1378,7 +1382,10 @@ def status_text(ctx, conn) -> str:
         if s["active_run_id"]:
             r = db.get_run(conn, s["active_run_id"])
             if r and r["status"] in ("PREPARED", "DISPATCHED"):
+                hb, _ = _worker_activity(ctx, r)
                 lines.append(f"   run {r['key']} ({r['role']}/{r['model']}) "
+                             f"{_mins_between(r['created_at'], common.now()) or 0}m"
+                             f"{'' if hb is None else f' · active {hb}m ago'} "
                              f"since {common.local_str(r['created_at'], '%m-%d %H:%M')}")
     if not tgm.from_ctx(ctx):
         lines.append("⚠ telegram: WAITING_CONFIG (see README)")
@@ -1411,6 +1418,131 @@ def _run_outcome(conn, run) -> str:
     if role == "planner":
         return f"plan with {len(obj.get('tasks', []))} task(s)" if obj else "no plan artifact"
     return (run["note"] or obj.get("summary") or "").strip()[:160] or run["status"]
+
+
+def _mins_between(a_iso, b_iso):
+    try:
+        return int((common.parse_iso(b_iso) - common.parse_iso(a_iso)).total_seconds() // 60)
+    except (ValueError, TypeError):
+        return None
+
+
+def _worker_activity(ctx, run):
+    """(age_min, doing) — freshest liveness signal for a worker session.
+    Primary: the CLI's session transcript (~/.claude/projects/*/<sid>.jsonl),
+    appended on every message even in headless -p mode (verified live; the
+    statusline never fires headless, so telemetry/sessions alone would read
+    'no heartbeat' forever). Statusline file kept as a fallback for any
+    interactive session. `doing` is metadata only — last tool name(s) /
+    message direction, never transcript content (owner-visible surface)."""
+    sid = json.loads(run["external"] or "{}").get("session")
+    if not sid:
+        return None, None
+    import time as _t
+    ages, doing = [], None
+    base = Path(ctx.getenv("EC_CLAUDE_PROJECTS")
+                or Path.home() / ".claude" / "projects")
+    hits = list(base.glob(f"*/{sid}.jsonl"))
+    if hits:
+        p = max(hits, key=lambda q: q.stat().st_mtime)
+        lines = []
+        try:
+            ages.append((_t.time() - p.stat().st_mtime) / 60)
+            with open(p, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 65536))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            pass
+        for line in reversed(lines):
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") == "assistant":
+                names = [c.get("name") for c in
+                         ((o.get("message") or {}).get("content") or [])
+                         if isinstance(c, dict) and c.get("type") == "tool_use"]
+                doing = ("tool: " + ",".join(n for n in names if n)
+                         if any(names) else "writing")
+                break
+            if o.get("type") == "user":
+                doing = "reading tool result"
+                break
+    obj = common.read_json(ctx.root / "telemetry" / "sessions" / f"{sid}.json")
+    if obj and obj.get("ts"):
+        a = _mins_between(obj["ts"], common.now())
+        if a is not None:
+            ages.append(a)
+    return (max(0, int(min(ages))) if ages else None), doing
+
+
+def gov_now(ctx, conn):
+    """This tick's governor view + READY step ids (shared by /status, /workers)."""
+    view = json.loads(db.kv_get(conn, "capacity_state") or "{}")
+    usage = cap.current_usage(conn)
+    ready = [s["id"] for s in live_steps(conn) if step_ready(conn, s)]
+    gov = cap.governor(ctx, conn, view, usage,
+                       len([r for r in ready if not db.get_step(conn, r)["background"]]))
+    return gov, ready, view, usage
+
+
+def idle_reason(conn, gov, ready) -> str:
+    """Why zero workers are running — checked in the order the tick gates
+    dispatch, so the first true condition is the operative one."""
+    if db.kv_get(conn, "roadmap_started") != "1":
+        return "roadmap not started (python control.py start)"
+    if db.kv_get(conn, "paused") == "1":
+        why = db.kv_get(conn, "paused_why") or \
+            "paused directly in state.db (maintenance edit window?)"
+        return f"PAUSED: {why} — /resume to continue"
+    hold = db.kv_get(conn, "quota_hold_until")
+    if hold and not common.is_past(hold):
+        return f"quota hold until {common.local_str(hold)}"
+    if gov["target"] == 0:
+        return f"dispatch target 0 (pressure {gov['pressure']})"
+    if not ready:
+        return "no READY steps (waiting on dependencies, soak, or retry timers)"
+    return "dispatch expected next tick"
+
+
+def workers_text(ctx, conn, probe=None) -> str:
+    """Live answer to 'what are the workers doing right now': every open run
+    with process liveness (probe) + statusline heartbeat age, the idle reason
+    when nothing runs, and the last few finished runs with outcomes."""
+    probe = probe or cr.probe
+    runs = [r for r in db.open_runs(conn) if r["role"] != "probe"]
+    lines = [f"workers: {len(runs)} active"]
+    for r in runs:
+        phase = probe(ctx, r)["phase"]
+        el = _mins_between(r["created_at"], common.now()) or 0
+        left = _mins_between(common.now(), r["deadline"]) if r["deadline"] else None
+        dl = "" if left is None else (f" · {left}m to deadline" if left >= 0
+                                      else f" · {-left}m OVERDUE")
+        hb, doing = _worker_activity(ctx, r)
+        hbs = ("local (no session)" if r["role"] == "test"
+               else "no heartbeat yet" if hb is None else f"active {hb}m ago")
+        if doing and r["role"] != "test":
+            hbs += f" · {doing}"
+        who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+        step = db.get_step(conn, r["step_id"])
+        lines.append(f"• {r['step_id']} {who} [{phase}] {el}m in{dl} · {hbs}")
+        lines.append(f"   {r['key']} · {r['lane']} lane"
+                     + (f" — [{step['state']}] {step['title']}" if step else ""))
+    if not runs:
+        gov, ready, _, _ = gov_now(ctx, conn)
+        lines.append("none — " + idle_reason(conn, gov, ready))
+    done = conn.execute(
+        "SELECT * FROM runs WHERE status NOT IN ('PREPARED','DISPATCHED') "
+        "AND role!='probe' ORDER BY id DESC LIMIT 5").fetchall()
+    if done:
+        lines.append("recent:")
+        for r in done[::-1]:
+            who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+            lines.append(f"· {common.local_str(r['ended_at'] or r['created_at'])} "
+                         f"{r['step_id']} {who} [{r['status']}] "
+                         f"{_run_outcome(conn, r)[:120]}")
+    return "\n".join(lines)[:3900]  # telegram hard limit 4096
 
 
 def why_text(ctx, conn, step_id=None) -> str:
@@ -1474,11 +1606,16 @@ def handle_commands(ctx, conn, tg, cmds):
         db.event(conn, ctx, "tg_command", cmd=name, arg=arg)
         if name == "/status":
             tg.send(status_text(ctx, conn))
+        elif name == "/workers":
+            tg.send(workers_text(ctx, conn))
         elif name == "/pause":
             db.kv_set(conn, "paused", "1")
+            db.kv_set(conn, "paused_why",
+                      f"/pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
             tg.send("engine-control: paused (running workers finish; no new dispatch)")
         elif name == "/resume":
             db.kv_set(conn, "paused", "0")
+            db.kv_set(conn, "paused_why", "")
             for step in live_steps(conn):
                 if step["state"] == "WAITING_USER":
                     db.transition(conn, ctx, step["id"],
@@ -1638,6 +1775,8 @@ def tick(ctx) -> int:
                 # DAG scheduler the safe containment is pausing dispatch
                 if db.kv_get(conn, "paused") != "1":
                     db.kv_set(conn, "paused", "1")
+                    db.kv_set(conn, "paused_why",
+                              f"auto-pause: persistent controller error x{streak}")
                     tgm.notify(conn, ctx, f"orch-pause:{episode}",
                                "engine-control: persistent controller error — dispatch "
                                "PAUSED (running workers finish). /resume after repair.")
@@ -1729,6 +1868,7 @@ def cmd_start(ctx) -> int:
     run_id = f"run-{common.now()[:10]}-{_uuid.uuid4().hex[:8]}"
     db.kv_set(conn, "roadmap_run_id", run_id)
     db.kv_set(conn, "paused", "0")
+    db.kv_set(conn, "paused_why", "")
     db.kv_set(conn, "pace", db.kv_get(conn, "pace", "auto"))
     db.kv_set(conn, "roadmap_started", "1")
     db.event(conn, ctx, "roadmap_started", run_id=run_id, tier=view.get("tier"),
@@ -1876,8 +2016,8 @@ def main(argv=None):
     except (AttributeError, OSError):
         pass
     ap = argparse.ArgumentParser(prog="control.py")
-    ap.add_argument("cmd", choices=["tick", "start", "status", "why", "pause",
-                                    "resume", "retry", "abort", "log", "init",
+    ap.add_argument("cmd", choices=["tick", "start", "status", "workers", "why",
+                                    "pause", "resume", "retry", "abort", "log", "init",
                                     "doctor", "install-task", "uninstall-task",
                                     "telegram-detect-chat"])
     ap.add_argument("target", nargs="?", default=None,
@@ -1902,12 +2042,19 @@ def main(argv=None):
     conn = db.connect(ctx)
     if args.cmd == "status":
         print(status_text(ctx, conn))
+    elif args.cmd == "workers":
+        print(workers_text(ctx, conn))
     elif args.cmd == "why":
         print(why_text(ctx, conn, args.target))
     elif args.cmd == "pause":
-        db.kv_set(conn, "paused", "1"); print("paused")
+        db.kv_set(conn, "paused", "1")
+        db.kv_set(conn, "paused_why",
+                  f"CLI pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
+        print("paused")
     elif args.cmd == "resume":
-        db.kv_set(conn, "paused", "0"); print("resumed")
+        db.kv_set(conn, "paused", "0")
+        db.kv_set(conn, "paused_why", "")
+        print("resumed")
     elif args.cmd == "retry":
         class _T:  # reuse telegram handler without a bot
             def send(self, t): print(t)

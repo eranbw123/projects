@@ -49,6 +49,7 @@ python control.py doctor          # environment/config health check
 python control.py init           # clone workspaces, create automation/integration
 python control.py start          # START THE ROADMAP (the tick drives it after this)
 python control.py status         # roadmap + step + active-run overview
+python control.py workers        # live workers: liveness, heartbeat, idle reason
 python control.py pause          # stop dispatching (running workers finish)
 python control.py resume         # resume dispatching
 python control.py retry          # re-arm a BLOCKED step (fresh cycle)
@@ -58,7 +59,9 @@ python control.py install-task   # install the once-per-minute tick task
 python control.py uninstall-task
 ```
 
-Telegram commands: `/status /pause /resume /log /prs`, `/retry [step-id]`
+Telegram commands: `/status /workers /pause /resume /log /prs`, `/retry [step-id]`
+(`/workers` shows each live worker's role, elapsed time, deadline, process
+liveness, and statusline heartbeat — and, when idle, the reason nothing runs),
 (re-arm BLOCKED steps), `/abort [step-id]` (abort one step; its dependents
 never start; independent branches continue), `/profile auto|max5|max20|pro`
 (capacity override — debug only), `/pace auto|economy|balanced|sprint`.
