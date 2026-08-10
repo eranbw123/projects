@@ -27,9 +27,11 @@ SSH session or on the tick that launched them.
 The controller infers the effective Claude subscription from sanitized
 evidence only: `claude auth status` output plus whitelisted non-secret fields
 of `.claude.json` (`organizationRateLimitTier` → max5/max20, organization
-type, profile freshness). Credentials files are never parsed. Conflicting or
-stale caches resolve by freshness, fall back conservatively, and trigger a
-tiny bounded haiku "refresh probe" (rate-limited) until resolved. Utilization
+type, profile freshness). Credentials files are never parsed. Exact
+rate-limit-tier evidence always outranks family-level subscription strings
+(whose derivation time is unknowable); ambiguous or conflicting exact
+evidence falls back conservatively, and unresolved detection triggers a tiny
+bounded haiku "refresh probe" (rate-limited) until it converges. Utilization
 (5-hour and 7-day windows) comes from Claude Code's own usage cache plus an
 automation-only statusline hook; high pressure first stops background work,
 then new implementation, and near exhaustion preserves capacity for reviews,

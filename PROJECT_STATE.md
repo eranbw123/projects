@@ -33,17 +33,22 @@ Controller error streak ≥8 → auto-pause + notify (never blocks a healthy ste
 plan_mode auto (kv plan_override = debug escape hatch, /profile). Evidence:
 `claude auth status` JSON (cached 30m) + whitelisted `.claude.json`
 oauthAccount fields (organizationRateLimitTier default_claude_max_5x/20x →
-max5/max20; organizationType; freshness=profileFetchedAt) + credentials-file
-mtime. Never parses credentials. Conflicts: fresher exact tier wins
-(probable) else conservative-min (conflict); bounded haiku refresh probe
-(≥10m apart, ≤3/episode, quota-aware) while unresolved/contested. Measured
-(smoke, CLI 2.1.226): headless -p sessions refresh NO caches — freshness
-arrives passively (token refresh → family-level subscriptionType; any
-interactive session → profile+usage), stale telemetry degrades to the
-conservative unknown band, and CLI quota hits are the hard backstop. Plan
-transitions therefore propagate: family-level within ~a token refresh,
-exact 5x/20x on next interactive/daemon profile fetch — safe both directions
-(under-parallelize until evidence; overshoot caught by WAITING_QUOTA). Tiers →
+max5/max20; organizationType; freshness=profileFetchedAt). Never parses
+credentials. Resolution: EXACT rate-limit-tier fields always outrank
+family-level strings (subscriptionType/organizationType — their derivation
+time is unknowable; a token refresh rewrites credentials without re-deriving
+them, so freshness arbitration against them flaps — reviewer finding,
+removed). Exact-vs-exact disagreement → conservative-min "conflict";
+family-only disagreement → conservative-min; exact-vs-family disagreement →
+exact wins, "probable" + contested (bounded haiku probe ≥10m apart,
+≤3/episode, quota-aware, keeps trying to converge). Known one-directional
+blind spot: a REAL Max→Pro downgrade stays invisible until the next
+interactive/daemon profile fetch — safe because quota hits only WAIT (no
+rungs, no BLOCK). Measured (smoke, CLI 2.1.226): headless -p sessions
+refresh NO caches — freshness arrives passively (token refresh →
+family-level subscriptionType; any interactive session → profile+usage),
+stale telemetry degrades to the conservative unknown band, and CLI quota
+hits are the hard backstop. Tiers →
 envelopes: max20 4/5 (opus 2), max5+max_unknown 2/3, pro 1/2, unknown 1/1;
 fable cap 1 everywhere. Utilization: cachedUsageUtilization (primary) +
 automation statusline files (`telemetry/sessions/`, atomic, whitelist-only)
@@ -72,15 +77,18 @@ silently ignore.
 - tempfile.mkdtemp dirs (Py3.13+) carry a restricted DACL the Task-Scheduler
   logon session cannot read → tests use harness.mkroot(); never mkdtemp for
   anything a scheduled task must read.
-- Live conflict observed: profile said max20 (fresh), credentials said pro
-  (stale) — detector resolves via freshness+probe; do not "fix" by hand.
+- Live conflict observed: profile says max20 (exact), credentials say pro
+  (stale family string predating the 08-04 upgrade) — the exact tier wins by
+  rule; detection stays contested + probing. Do not "fix" by hand.
 
 ## Tests
-tests/: test_infra 13 · test_flow 19 · test_capacity 36 (detector §39 matrix,
-telemetry §40, governor policy) · test_dag 13 (topology, parallel diamond,
-background lane, upgrade/downgrade, pressure, quota hold, fable cap, audit
-step, overlap conflict, concurrent recovery). All green 2026-08-10.
-`scripts/smoke_real.py` = tiny real-Claude smoke (§45).
+tests/: test_infra 13 · test_flow 19 · test_capacity 38 (detector matrix,
+telemetry matrix, governor policy, shape-drift, finish-cap) · test_dag 15
+(topology, parallel diamond, background lane incl. stale-telemetry,
+upgrade/downgrade, pressure, quota hold + sustained outage, fable cap, audit
+step, overlap conflict, concurrent recovery). All green 2026-08-10 after
+independent Opus review REPAIR round. `scripts/smoke_real.py` = tiny
+real-Claude smoke (§45), PASS.
 
 ## Start the roadmap
 `python control.py start` (verifies DAG, auth, tick task, backs up state.db,
