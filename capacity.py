@@ -566,6 +566,7 @@ ROLE_CLASS = {
     "reviewer": "finish", "repair": "finish", "diagnostic": "finish",
     "audit": "finish",
     "implementer": "build", "planner": "plan",
+    "docs": "build",   # dispatched with background=True: never steals a slot
 }
 # classes allowed per pressure level (free/local always allowed).
 # background stays allowed under moderate/unknown pressure: stale telemetry

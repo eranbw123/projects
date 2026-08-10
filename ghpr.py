@@ -102,6 +102,9 @@ def pr_body(conn, repo: str, baseline: str, tip: str) -> str:
         "",
         f"- Baseline (roadmap pin): `{baseline[:12]}`",
         f"- Last validated push: `{tip[:12]}` at {common.now()}",
+        "- README + repo description: maintained automatically"
+        + (f" (last refresh covered `{db.kv_get(conn, f'docs_tip:{repo}')[:12]}`)"
+           if db.kv_get(conn, f"docs_tip:{repo}") else " (first refresh pending)"),
         "",
         "| roadmap step | state | commits | last integrated |",
         "|---|---|---|---|",

@@ -29,6 +29,22 @@ after merge when new work lands). Failures notify once per tip + 10m backoff,
 never the error streak; runs while paused; idle cost 2 kv reads. gh CLI =
 auth/API (EC_GH_EXE). Telegram: push/PR-open notifications, `/prs`.
 
+## GitHub docs visibility (2026-08-10)
+`ghdocs.py` tick phase (runs before pr_sync; skips itself while paused): when
+kv pr_pushed advances past docs_tip, dispatches ONE background sonnet `docs`
+worker (ROLES entry; ROLE_CLASS build + background=True — never steals a
+slot; 6h cooldown kv docs_next_at, bypassed when README missing at tip) in a
+worktree at the published tip. Acceptance is mechanical: README.md-only diff
++ no secrets, else reject (kv docs_reject — that tip never retried; event +
+notify). Apply: cherry-pick -x onto integration (provenance-grep idempotent,
+defers while repo_integration_busy), advance pr_tip (test-green by
+construction: code identical to validated tip). Repo description: worker
+result `description` → kv gh_desc_want → `gh api PATCH repos/{slug}` (kv
+gh_desc caches; retried via gh_desc_want after backoff). Failures event +
+notify once per tip + 1h backoff; never the error streak. PR body shows docs
+freshness line. prompts/docs.md, schemas/docs_result.schema.json,
+tests/test_docs.py (17).
+
 ## Worker visibility (2026-08-10)
 `/workers` (tg + CLI): every open run with probe phase, elapsed/deadline,
 lane, step title, and a real heartbeat — session transcript mtime under
@@ -40,9 +56,11 @@ When idle it names the operative gate in tick order: not started / PAUSED
 write, reported as maintenance) / quota hold / target 0 / no READY steps.
 /status: idle reason line when 0 active; run lines show elapsed + activity
 age; in-flight multi-task steps show `task i/n` (PRs open per validated
-task, so a step legitimately keeps running after its first PR — the
-progress marker + "step continues" in the task-done notification make that
-visible). tests/test_workers.py (9).
+task, so a step legitimately keeps running after its first PR).
+`step_label()` puts the same 1-based `(task i/n)` on every task-scoped
+notification (review verdict, repair, tests, validation, quota, blocked,
+task-done "step continues") and on /workers run lines; single-task plans
+stay a bare step id. tests/test_workers.py (9).
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied

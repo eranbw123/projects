@@ -21,6 +21,7 @@ import capacity as cap
 import claude_runner as cr
 import common
 import db
+import ghdocs
 import ghpr
 import gitops
 import telegram as tgm
@@ -401,14 +402,22 @@ def wait_quota(ctx, conn, step):
     db.transition(conn, ctx, step["id"], "WAITING_QUOTA", "model quota/limit hit")
     if streak == 1 or streak % 8 == 0:
         tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
-                   f"engine-control: {step['id']} waiting on model quota "
+                   f"engine-control: {step_label(step)} waiting on model quota "
                    f"(streak {streak}); retry in {backoff}m. Resumes automatically.")
+
+
+def step_label(step) -> str:
+    """Owner-facing step name; multi-task plans carry the 1-based task
+    position so a mid-step message doesn't read as the whole step."""
+    d = db.step_detail(step)
+    n = d.get("tasks_n", 0)
+    return f"{step['id']} (task {d.get('task_idx', 0) + 1}/{n})" if n > 1 else step["id"]
 
 
 def goto_blocked(ctx, conn, step, reason):
     db.transition(conn, ctx, step["id"], "BLOCKED", reason)
     tgm.notify(conn, ctx, f"blocked:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step['id']} BLOCKED — {reason[:400]}\n"
+               f"engine-control: {step_label(step)} BLOCKED — {reason[:400]}\n"
                f"Full history: /why {step['id']} · then /retry or /abort.")
 
 
@@ -458,7 +467,7 @@ def dispatch_repair(ctx, conn, step, findings, pos):
                    "REPAIRING", f"repair rung {pos + 1}{why}",
                    model=model, effort=effort, resume_session=resume_session)
     tgm.notify(conn, ctx, f"repair:{run['key']}",
-               f"engine-control: {step['id']} repair started (rung {pos + 1}/{LADDER_MAX})")
+               f"engine-control: {step_label(step)} repair started (rung {pos + 1}/{LADDER_MAX})")
 
 
 def dispatch_diagnostic(ctx, conn, step, findings):
@@ -753,7 +762,7 @@ def enter_validation(ctx, conn, roadmap, step):
     dispatch(ctx, conn, step, "test", "", ws, "VALIDATING",
              "integration tests on promoted commits", test_cmds=rc["tests"])
     tgm.notify(conn, ctx, f"validate:{step['id']}:c{d.get('cycle',0)}t{d.get('task_idx',0)}",
-               f"engine-control: {step['id']} promoted to {INTEGRATION}; validation running")
+               f"engine-control: {step_label(step)} promoted to {INTEGRATION}; validation running")
 
 
 def cherry_pick_x(repo, sha):
@@ -1213,7 +1222,7 @@ def on_impl_like(ctx, conn, roadmap, step, run):
         repair_or_block(ctx, conn, step, "result claims done but no commits exist in worktree")
         return
     tgm.notify(conn, ctx, f"impl:{run['key']}",
-               f"engine-control: {step['id']} implementation finished — testing")
+               f"engine-control: {step_label(step)} implementation finished — testing")
     start_testing(ctx, conn, roadmap, step)
 
 
@@ -1228,7 +1237,7 @@ def on_testing(ctx, conn, roadmap, step, run):
     report = common.tail(obj.get("report"), 60)
     if obj.get("passed"):
         tgm.notify(conn, ctx, f"tests:{run['key']}",
-                   f"engine-control: {step['id']} tests green — review")
+                   f"engine-control: {step_label(step)} tests green — review")
         start_review(ctx, conn, roadmap, step)
     elif obj.get("no_tests"):
         # Exit code 5 = the runner COLLECTED NOTHING. That is a roadmap.yaml
@@ -1246,7 +1255,7 @@ def on_testing(ctx, conn, roadmap, step, run):
         db.set_run_note(conn, ctx, run["id"],
                         "tests failed: " + _fail_lines(report, 3))
         tgm.notify(conn, ctx, f"tests:{run['key']}",
-                   f"engine-control: {step['id']} tests FAILED — repair path")
+                   f"engine-control: {step_label(step)} tests FAILED — repair path")
         repair_or_block(ctx, conn, step, "tests failed:\n" + report)
 
 
@@ -1268,7 +1277,7 @@ def on_review(ctx, conn, roadmap, step, run):
             db.set_detail(conn, step["id"], d)
             verdict = obj["verdict"]
             tgm.notify(conn, ctx, f"review:{run['key']}",
-                       f"engine-control: {step['id']} review: {verdict}")
+                       f"engine-control: {step_label(step)} review: {verdict}")
             repo = current_repo(ctx, step)
             ws = Path(repo_cfg(roadmap, repo)["workspace"])
             gitops.worktree_remove(
@@ -1320,9 +1329,8 @@ def on_validating(ctx, conn, roadmap, step, run):
         db.set_detail(conn, step["id"], d)
         n = d.get("tasks_n", 1)
         tgm.notify(conn, ctx, f"task:{step['id']}:c{d.get('cycle',0)}t{idx}:done",
-                   f"engine-control: {step['id']} task {idx} integrated and validated "
-                   f"({len(done)}/{n} tasks"
-                   + ("; step continues)" if len(done) < n else ")"))
+                   f"engine-control: {step['id']} task {idx + 1}/{n} integrated and "
+                   "validated" + (" — step continues" if len(done) < n else ""))
     if len(done) < d.get("tasks_n", 1):
         step = db.get_step(conn, step["id"])
         start_task_impl(ctx, conn, roadmap, step, task_idx=len(done))
@@ -1526,7 +1534,10 @@ def workers_text(ctx, conn, probe=None) -> str:
             hbs += f" · {doing}"
         who = r["role"] + (f"/{r['model']}" if r["model"] else "")
         step = db.get_step(conn, r["step_id"])
-        lines.append(f"• {r['step_id']} {who} [{phase}] {el}m in{dl} · {hbs}")
+        n = db.step_detail(step).get("tasks_n", 0) if step else 0
+        slab = (f"{r['step_id']} (task {r['task_idx'] + 1}/{n})" if n > 1
+                else r["step_id"])
+        lines.append(f"• {slab} {who} [{phase}] {el}m in{dl} · {hbs}")
         lines.append(f"   {r['key']} · {r['lane']} lane"
                      + (f" — [{step['state']}] {step['title']}" if step else ""))
     if not runs:
@@ -1750,6 +1761,9 @@ def tick(ctx) -> int:
             if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
                 advance_all(ctx, conn, roadmap)
             if db.kv_get(conn, "roadmap_started") == "1":
+                # docs before pr_sync so an accepted README lands in the same
+                # tick's push. Skips itself while paused. Never raises.
+                ghdocs.docs_sync(ctx, conn, roadmap)
                 # runs even when paused: already-validated work should stay
                 # visible on GitHub during an incident. Never raises.
                 ghpr.pr_sync(ctx, conn, roadmap)

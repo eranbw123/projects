@@ -70,6 +70,12 @@ ROLES = {
     "audit":       dict(model="fable", effort="high", pm=None, deadline_min=60,
                         tools=["Read", "Grep", "Glob", "Write",
                                "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)"]),
+    "docs":        dict(model="sonnet", effort="high", pm="acceptEdits", deadline_min=30,
+                        tools=["Read", "Grep", "Glob", "Edit", "Write",
+                               "Bash(git status:*)", "Bash(git add:*)",
+                               "Bash(git commit:*)", "Bash(git diff:*)",
+                               "Bash(git log:*)", "Bash(git show:*)",
+                               "Bash(git rev-parse:*)", "Bash(git ls-files:*)"]),
     "test":        dict(model=None, effort=None, pm=None, deadline_min=45, tools=[]),
     # capacity refresh probe: cheapest model, no tools, no repo context
     "probe":       dict(model="haiku", effort=None, pm=None, deadline_min=8, tools=None),
