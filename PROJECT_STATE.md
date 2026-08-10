@@ -54,13 +54,55 @@ fallback only) + last tool name (metadata only, never transcript content).
 When idle it names the operative gate in tick order: not started / PAUSED
 (kv `paused_why`: set by /pause, CLI pause, auto-pause; empty = direct kv
 write, reported as maintenance) / quota hold / target 0 / no READY steps.
-/status: idle reason line when 0 active; run lines show elapsed + activity
-age; in-flight multi-task steps show `task i/n` (PRs open per validated
-task, so a step legitimately keeps running after its first PR).
-`step_label()` puts the same 1-based `(task i/n)` on every task-scoped
-notification (review verdict, repair, tests, validation, quota, blocked,
-task-done "step continues") and on /workers run lines; single-task plans
-stay a bare step id. tests/test_workers.py (9).
+/status: progress header (`RUNNING · a/n accepted`), per-step lines via
+`step_line()` — READY vs `waits dep+dep` for PENDING, `task i/n`,
+`round r` + `f/4 hard-failed` (grant-relative), `retry k` (cycle),
+time-in-state, soak/quota
+timers; run lines show elapsed + activity age (PRs open per validated task,
+so a step legitimately keeps running after its first PR). Future timestamps
+render day-aware (`common.local_when`: "tomorrow 19:56" — a bare HH:MM on a
+24h soak read as overdue, owner confusion 2026-08-10); SOAKING lines drop
+ladder bits for `validated — auto-accepts <when> · no action needed`, /why
+opens SOAKING with the same explanation, README documents the lifecycle
+(soak_minutes/soak_check/:validated). `step_label()`
+puts the same 1-based `(task i/n)` on every task-scoped notification;
+single-task plans stay a bare step id.
+
+## Notification grammar (2026-08-10)
+Owner asked: every message carries its context, not just the event. Emoji
+headline (▶️📋🔨🧪❌🔍🛠📦☑️✅⏳⌛⛔🔌🔁⚠) + detail lines + context tail via
+`attempts_note` (round r · f/4 hard-failed · retry k), `roadmap_note` (a/n
+accepted),
+`dependents_of` (BLOCKED names stalls:, ACCEPTED names unblocks: among
+now-READY), `accepted_text` (tasks/commits/attempts/duration). tests-FAILED
+carries `_fail_hits` lines; review verdicts carry `_findings_lines`
+(severity: issue); plan-ready lists task objectives; repair says what it
+fixes + model/resumed; quota shows usage% + absolute retry time;
+planner/reviewer/audit retries notify (were silent). "engine-control:"
+prefix dropped — dedicated bot chat. /help (+/start alias) lists commands;
+unknown slash cmds answer with a /help pointer (consume forwards any "/");
+/why whitelisted (was handled but dropped by consume — unreachable); tg /log
+renders events human (`_fmt_event`), CLI log stays raw. tests:
+test_workers.py (16), test_flow TestValidatorGate pins fail-lines+round.
+
+## Repair ladder redesign (2026-08-10)
+Owner: genuine review findings must not stop the process; /retry must not
+restart from scratch. Budget = 4 HARD failures per grant (`burned`; worker
+failed / no commits / tests red; `burn_mark`=active_run_id dedupes capacity
+re-entries). Rounds where review finds new gating defects after real work
+burn nothing (`progressed=True`); fuse `EC_LADDER_TOTAL_MAX` (10, env) total
+rounds per grant → BLOCKED "not converging". Diagnostic fires each 3rd round
+of a grant (`diag_round` window). Reviewer severity is a promotion gate
+(prompts/reviewer.md): minor/info-only REPAIR → `review_advisory` event +
+promote with notes. Warm /retry (plan+worktree alive): same cycle,
+`rung_floor` marks grant start (ladder_rounds = ladder_pos − rung_floor),
+budget/diag reset, → REPAIRING if last_findings else TESTING; last_findings
+cleared on no-tests-collected and controller-error blocks so warm retry
+re-enters at tests; REVIEW BLOCK stores findings so it re-enters at repair.
+Cold /retry (worktree gone): fresh cycle, replan. tests: test_flow
+TestRetryWarm / TestRetryColdWhenWorktreeGone / TestReviewConvergence /
+TestAdvisoryFindingsPromote / TestRunawayFuse; stub reviewer mode
+`repair_minor`.
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied
@@ -75,7 +117,8 @@ local-test cap). Integration stays serialized per repo
 (`repo_integration_busy` defers enter_validation; deferral is idempotent —
 DONE runs are reprocessed next tick). Stale parallel work: base recorded per
 task; ancestry + cherry-pick conflict → REPAIR, never reset. A BLOCKED step
-blocks only its dependents; /retry [step] re-arms, /abort [step] prunes.
+blocks only its dependents; /retry [step] resumes in-place (cold replan only
+when the worktree is gone), /abort [step] prunes.
 Controller error streak ≥8 → auto-pause + notify (never blocks a healthy step).
 
 ## Capacity (all AUTO; no owner action on plan changes)
@@ -118,7 +161,7 @@ every worker otherwise) + billing/nesting env stripped.
 ## Auth/billing gate
 Not subscription (api key/gateway env/logged out) → all steps WAITING_AUTH,
 notify once, auto-recheck; `cmd_start` refuses launch. WAITING_AUTH is a
-WAITING state (never consumes attempts).
+WAITING state (never consumes repair budget).
 
 ## Roadmap DAG (roadmap.yaml)
 01,02 parallel roots · 03,04←02 (parallel) · 05←03+04 (fable planner) ·

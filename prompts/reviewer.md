@@ -36,10 +36,26 @@ commit.
   "repairing" an inconvenient negative result.
 
 ## Verdict rules
-- PASS: acceptable as-is.
-- REPAIR: concrete fixable defects — list them precisely.
+Severity is a promotion gate, not a size estimate — ask "must this block
+promotion?", not "is this worth mentioning?":
+- critical/major: materially compromises the objective, the acceptance focus,
+  correctness on a supported path, or safety. These gate.
+- minor/info: real but advisory — hardening, style, docs, polish, latent
+  edge cases outside the acceptance focus. These are recorded and ride along;
+  they do NOT gate promotion.
+
+Verdicts:
+- PASS: no critical/major findings. STILL list minor/info findings — they are
+  kept as advisory notes.
+- REPAIR: at least one critical/major finding — concrete and fixable; list
+  each precisely. (A REPAIR whose findings are all minor/info is promoted
+  anyway, so never use REPAIR for emphasis.)
 - BLOCK: fundamentally wrong approach, scope violation, or safety issue that
   a small repair cannot fix.
+
+The work you review may be round N of a converging loop: judge the CURRENT
+diff against the objective, not against perfection. Finding new minor issues
+each round is expected; only genuine gates justify another round.
 
 ## Output (MANDATORY)
 Write JSON to exactly this path using the Write tool:

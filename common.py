@@ -64,6 +64,24 @@ def local_str(iso: str, fmt: str = "%H:%M") -> str:
         return str(iso or "")
 
 
+def local_when(iso: str) -> str:
+    """Like local_str, but never hides the day: a 24h soak deadline shown as
+    a bare '19:56' reads as already-overdue. Today stays 'HH:MM'; adjacent
+    days say so; anything further shows the date."""
+    try:
+        dt = parse_iso(iso).astimezone()
+    except (ValueError, TypeError):
+        return str(iso or "")
+    days = (dt.date() - datetime.now().astimezone().date()).days
+    if days == 0:
+        return dt.strftime("%H:%M")
+    if days == 1:
+        return "tomorrow " + dt.strftime("%H:%M")
+    if days == -1:
+        return "yesterday " + dt.strftime("%H:%M")
+    return dt.strftime("%m-%d %H:%M")
+
+
 def load_env_file(path: Path) -> dict:
     env = {}
     if path.exists():

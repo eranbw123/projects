@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from harness import CODE, Sandbox, git
@@ -73,6 +74,18 @@ class TestInfra(unittest.TestCase):
                     {"version": 1, "step_id": "s", "acceptance": ["a"],
                      "tasks": [{"repo": "r"}]}]:
             self.assertTrue(common.schema_errors(bad, schema))
+
+    def test_local_when_never_hides_the_day(self):
+        # A 24h soak deadline rendered as a bare 'HH:MM' reads as overdue;
+        # local_when must name the day whenever it is not today.
+        def iso_at(days):
+            target = datetime.now().astimezone() + timedelta(days=days)
+            return target.astimezone(timezone.utc).isoformat(timespec="seconds")
+        self.assertRegex(common.local_when(iso_at(0)), r"^\d{2}:\d{2}$")
+        self.assertTrue(common.local_when(iso_at(1)).startswith("tomorrow "))
+        self.assertTrue(common.local_when(iso_at(-1)).startswith("yesterday "))
+        self.assertRegex(common.local_when(iso_at(5)), r"^\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual(common.local_when(""), "")   # tolerant like local_str
 
     def test_redaction_and_event_storage(self):
         ctx = self.sb.ctx()

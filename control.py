@@ -27,7 +27,12 @@ import gitops
 import telegram as tgm
 import validators as vd
 
-LADDER_MAX = 4          # implementation + repair1 + repair2(fresh) + final repair
+LADDER_MAX = 4          # HARD-FAILED rungs per grant (worker failed / no
+                        # commits / tests red) — genuine new review findings
+                        # never burn budget, they are the process working
+LADDER_TOTAL_MAX = 10   # fuse: total rungs per grant even when every round
+                        # progresses (endless polite review loop). /retry
+                        # refreshes both budgets in-place.
 PLANNER_TRIES = 2
 REVIEWER_TRIES = 2
 QUOTA_RETRY_MIN = 30
@@ -307,8 +312,11 @@ def reconcile(ctx, conn):
                 db.set_detail(conn, step["id"], d)
                 db.transition(conn, ctx, step["id"], "INTERRUPTED",
                               f"worker {run['key']} lost")
+                who = run["role"] + (f"/{run['model']}" if run["model"] else "")
+                el = _mins_between(run["created_at"], common.now()) or 0
                 tgm.notify(conn, ctx, f"lost:{run['key']}",
-                           f"engine-control: worker lost ({run['key']}), will respawn after reconcile")
+                           f"🔌 {step_label(step)} {who} worker lost after {el}m "
+                           f"— respawns automatically ({run['key']})")
         elif pr["phase"] == "running" and run["deadline"] and common.is_past(run["deadline"]):
             cr.kill_run(ctx, run)
             db.finish_run(conn, ctx, run["id"], "FAILED", exit_code=124,
@@ -396,14 +404,17 @@ def wait_quota(ctx, conn, step):
     # commissioning review finding). Backoff escalates 1x/2x/4x and the owner
     # is re-notified periodically instead.
     backoff = retry_min * (2 ** min(streak // 5, 2))
+    retry_at = common.iso_in(backoff * 60)
     with conn:
-        conn.execute("UPDATE steps SET retry_at=? WHERE id=?",
-                     (common.iso_in(backoff * 60), step["id"]))
+        conn.execute("UPDATE steps SET retry_at=? WHERE id=?", (retry_at, step["id"]))
     db.transition(conn, ctx, step["id"], "WAITING_QUOTA", "model quota/limit hit")
     if streak == 1 or streak % 8 == 0:
+        u = (f"usage 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}% · "
+             if usage and not usage.get("stale") else "")
         tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
-                   f"engine-control: {step_label(step)} waiting on model quota "
-                   f"(streak {streak}); retry in {backoff}m. Resumes automatically.")
+                   f"⌛ {step_label(step)} waiting on model quota (hit {streak})\n"
+                   f"{u}retry in {backoff}m (~{common.local_when(retry_at)}) · "
+                   "resumes automatically")
 
 
 def step_label(step) -> str:
@@ -414,31 +425,116 @@ def step_label(step) -> str:
     return f"{step['id']} (task {d.get('task_idx', 0) + 1}/{n})" if n > 1 else step["id"]
 
 
+def _fmt_dur(mins) -> str:
+    """43m / 3h05m / 2d4h — owner-facing duration."""
+    if mins is None:
+        return "?"
+    m = max(0, int(mins))
+    if m < 60:
+        return f"{m}m"
+    if m < 1440:
+        return f"{m // 60}h{m % 60:02d}m"
+    return f"{m // 1440}d{(m % 1440) // 60}h"
+
+
+def attempts_note(conn, step) -> str:
+    """'round r · f/4 hard-failed · retry k' — where the current grant stands.
+    Owner finding 2026-08-10: lifecycle messages without this hide whether a
+    step is on its first try or its last chance. Rounds are grant-relative
+    (a warm /retry refreshes the budget without hiding history)."""
+    d = db.step_detail(step)
+    rounds = ladder_rounds(conn, step, d)
+    burned = d.get("burned", 0)
+    parts = ([f"round {rounds}"] if rounds else []) \
+        + ([f"{burned}/{LADDER_MAX} hard-failed"] if burned else []) \
+        + ([f"retry {d['cycle']}"] if d.get("cycle") else [])
+    return " · ".join(parts)
+
+
+def roadmap_note(conn) -> str:
+    rows = conn.execute("SELECT state FROM steps").fetchall()
+    acc = sum(1 for r in rows if r["state"] == "ACCEPTED")
+    return f"roadmap {acc}/{len(rows)} accepted"
+
+
+def dependents_of(conn, step_id) -> list[str]:
+    """PENDING steps that name step_id in depends_on — what a BLOCK stalls
+    and an ACCEPT moves toward READY."""
+    out = []
+    for s in conn.execute(
+            "SELECT id, depends_on FROM steps WHERE state='PENDING' ORDER BY ordinal"):
+        if step_id in [str(x).split(":")[0] for x in json.loads(s["depends_on"] or "[]")]:
+            out.append(s["id"])
+    return out
+
+
 def goto_blocked(ctx, conn, step, reason):
     db.transition(conn, ctx, step["id"], "BLOCKED", reason)
-    tgm.notify(conn, ctx, f"blocked:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step_label(step)} BLOCKED — {reason[:400]}\n"
-               f"Full history: /why {step['id']} · then /retry or /abort.")
-
-
-def repair_or_block(ctx, conn, step, findings: str):
+    step = db.get_step(conn, step["id"])  # fresh counters for the notify
     d = db.step_detail(step)
-    task_idx = d.get("task_idx", 0)
-    cycle = d.get("cycle", 0)
-    pos = db.ladder_pos(conn, step["id"], task_idx, cycle)
+    rounds = ladder_rounds(conn, step, d)
+    stalls = dependents_of(conn, step["id"])
+    warm = bool(step["plan_path"] and d.get("task_wt")
+                and Path(d["task_wt"]).exists())
+    bits = [f"round {rounds} · hard-failed {d.get('burned', 0)}/{LADDER_MAX}"] \
+        + ([f"retry {d['cycle']}"] if d.get("cycle") else []) \
+        + (["stalls: " + ", ".join(stalls)] if stalls else [])
+    tgm.notify(conn, ctx, f"blocked:{step['id']}:{d.get('cycle',0)}",
+               f"⛔ {step_label(step)} BLOCKED — {reason[:400]}\n"
+               + " · ".join(bits) + "\n"
+               f"/why {step['id']} · /retry {step['id']}"
+               + (" (resumes in-place, work kept)" if warm else "")
+               + f" · /abort {step['id']}")
+
+
+def ladder_rounds(conn, step, d=None) -> int:
+    """Rungs consumed in the CURRENT grant: total for (task, cycle) minus the
+    floor recorded by a warm /retry (which refreshes budget without wiping
+    the cycle's history)."""
+    d = db.step_detail(step) if d is None else d
+    return db.ladder_pos(conn, step["id"], d.get("task_idx", 0),
+                         d.get("cycle", 0)) - d.get("rung_floor", 0)
+
+
+def repair_or_block(ctx, conn, step, findings: str, progressed=False):
+    """Route a failed round. The budget distinguishes HOW it failed: a rung
+    that did real work (commits, tests green) before an independent reviewer
+    found NEW defects is the process converging and never burns budget —
+    only hard failures do (progressed=False: worker failed, no commits,
+    tests red). LADDER_MAX bounds hard failures; LADDER_TOTAL_MAX is the
+    runaway fuse for endless always-something review loops. Owner finding
+    2026-08-10: step-01 was blocked after 4 rounds in which every repair
+    fixed every finding it was given and the final review itself said
+    'REPAIR, not BLOCK'."""
+    step = db.get_step(conn, step["id"])  # callers hold pre-set_detail rows;
+    d = db.step_detail(step)              # a stale write here loses counters
     d["last_findings"] = findings[:6000]
+    # burn once per outcome event: capacity-deferred dispatch re-enters here
+    # every tick with the same active run — that is one failure, not many
+    if not progressed and d.get("burn_mark") != step["active_run_id"]:
+        d["burned"] = d.get("burned", 0) + 1
+        d["burn_mark"] = step["active_run_id"]
     db.set_detail(conn, step["id"], d)
     if not d.get("task_wt"):
         goto_blocked(ctx, conn, step,
                      "failure before implementation stage: " + findings[:200])
         return
-    if pos >= LADDER_MAX:
-        goto_blocked(ctx, conn, step, f"repair budget exhausted ({pos} attempts). Last: {findings[:200]}")
+    rounds = ladder_rounds(conn, step, d)
+    if d.get("burned", 0) >= LADDER_MAX:
+        goto_blocked(ctx, conn, step,
+                     f"repair budget exhausted ({d['burned']} hard-failed "
+                     f"attempts in {rounds} rounds). Last: {findings[:200]}")
         return
-    if pos == 3 and not d.get("diagnosed"):
+    if rounds >= int(ctx.getenv("EC_LADDER_TOTAL_MAX", str(LADDER_TOTAL_MAX))):
+        goto_blocked(ctx, conn, step,
+                     f"not converging: {rounds} rounds this grant without a "
+                     f"review PASS (work is real but review keeps finding "
+                     f"more). Last: {findings[:200]}")
+        return
+    if rounds >= 3 and rounds - d.get("diag_round", 0) >= 3:
         dispatch_diagnostic(ctx, conn, step, findings)
         return
-    dispatch_repair(ctx, conn, step, findings, pos)
+    dispatch_repair(ctx, conn, step, findings, rounds)
 
 
 def dispatch_repair(ctx, conn, step, findings, pos):
@@ -446,9 +542,12 @@ def dispatch_repair(ctx, conn, step, findings, pos):
     scfg = step_cfg(roadmap, step["id"])
     if not gate(ctx, conn, "repair", route_model(scfg, "repair")[0]):
         return  # findings persisted; retried next tick
+    step = db.get_step(conn, step["id"])
     d = db.step_detail(step)
     resume_session = None
-    if pos == 1:  # first repair continues the implementer's session context
+    # only the genuine first repair right after implementation resumes the
+    # implementer's session (a warm-retry grant starts long after it died)
+    if pos == 1 and not d.get("rung_floor"):
         impl = conn.execute(
             "SELECT * FROM runs WHERE step_id=? AND task_idx=? AND cycle=? AND role='implementer' "
             "AND status IN ('DONE','FAILED') ORDER BY id DESC LIMIT 1",
@@ -464,10 +563,14 @@ def dispatch_repair(ctx, conn, step, findings, pos):
     # alone forced a trip into artifact dirs to learn why (owner finding).
     why = " — " + (findings or "").strip().splitlines()[0][:160] if findings else ""
     run = dispatch(ctx, conn, step, "repair", prompt, d["task_wt"],
-                   "REPAIRING", f"repair rung {pos + 1}{why}",
+                   "REPAIRING", f"repair round {pos + 1}{why}",
                    model=model, effort=effort, resume_session=resume_session)
+    burned = d.get("burned", 0)
     tgm.notify(conn, ctx, f"repair:{run['key']}",
-               f"engine-control: {step_label(step)} repair started (rung {pos + 1}/{LADDER_MAX})")
+               f"🛠 {step_label(step)} repair round {pos + 1} started "
+               f"({model}{', resumed session' if resume_session else ''}"
+               + (f", {burned}/{LADDER_MAX} hard-failed" if burned else "") + ")"
+               + (f"\nfixing: {why[3:]}" if why else ""))
 
 
 def dispatch_diagnostic(ctx, conn, step, findings):
@@ -475,8 +578,9 @@ def dispatch_diagnostic(ctx, conn, step, findings):
     scfg = step_cfg(roadmap, step["id"])
     if not gate(ctx, conn, "diagnostic", route_model(scfg, "diagnostic")[0]):
         return
+    step = db.get_step(conn, step["id"])  # fresh: never write back stale detail
     d = db.step_detail(step)
-    d["diagnosed"] = True
+    d["diag_round"] = ladder_rounds(conn, step, d)  # one diagnostic per 3-round window
     db.set_detail(conn, step["id"], d)
     ws = Path(repo_cfg(roadmap, current_repo(ctx, step))["workspace"])
     head = gitops.current_sha(Path(d["task_wt"]))
@@ -560,8 +664,14 @@ def start_planning(ctx, conn, roadmap, step, new_step=False):
         "RESULT_PATH": "<<RESULT_PATH>>"})
     dispatch(ctx, conn, step, "planner", prompt, wt, "PLANNING",
              "planner dispatched", model=model, effort=effort)
-    tgm.notify(conn, ctx, f"start:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step['id']} started — {step['title']}")
+    d0 = db.step_detail(step)
+    in_flight = len([s for s in live_steps(conn)
+                     if s["state"] not in {"PENDING"} | common.HALT_STATES])
+    tgm.notify(conn, ctx, f"start:{step['id']}:{d0.get('cycle',0)}",
+               f"▶️ {step['id']} started — {step['title']}\n"
+               f"repos {', '.join(repos)} · planner {model}"
+               + (f" · retry {d0['cycle']}" if d0.get("cycle") else "") + "\n"
+               f"{roadmap_note(conn)} · {in_flight} in flight")
 
 
 def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
@@ -604,7 +714,7 @@ def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
     if not base or d.get("task_branch") != branch:
         base = integration_sha(roadmap, repo)
     d.update(task_idx=idx, task_base=base, task_branch=branch, task_wt=str(wt),
-             diagnosed=False)
+             burned=0, burn_mark=None, rung_floor=0, diag_round=0)
     db.set_detail(conn, step["id"], d)
     if not wt.exists():
         gitops.worktree_add(ws, wt, branch, base)
@@ -740,7 +850,8 @@ def enter_validation(ctx, conn, roadmap, step):
                     (step["id"], repo, d.get("task_idx", 0), task_key, sha, base,
                      integrated, common.now()))
 
-    for sha in gitops.commits_between(ws, base, head):
+    shas = gitops.commits_between(ws, base, head)
+    for sha in shas:
         already = gitops.git_ro(
             ["log", INTEGRATION, f"--grep=cherry picked from commit {sha}",
              "--format=%H", "-1"], cwd=ws, check=False).stdout.strip()
@@ -750,19 +861,23 @@ def enter_validation(ctx, conn, roadmap, step):
         status, new_sha = cherry_pick_x(ws, sha)
         if status == "conflict":
             db.event(conn, ctx, "cherry_conflict", step_id=step["id"], sha=sha)
+            # the work was fine; integration moved underneath it — environment
+            # drift, not a failed attempt (the fuse still bounds repeats)
             repair_or_block(ctx, conn, step,
                             f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}: "
                             "integration advanced under this task. Re-apply the change as new "
                             "commits that apply cleanly on the current integration content; if "
                             "that is impossible from this worktree, report status failed "
-                            "(the owner can /retry to re-plan from the new tip)")
+                            "(the owner can /retry to re-plan from the new tip)",
+                            progressed=True)
             return
         if status == "ok":
             record(sha, new_sha)
     dispatch(ctx, conn, step, "test", "", ws, "VALIDATING",
              "integration tests on promoted commits", test_cmds=rc["tests"])
     tgm.notify(conn, ctx, f"validate:{step['id']}:c{d.get('cycle',0)}t{d.get('task_idx',0)}",
-               f"engine-control: {step_label(step)} promoted to {INTEGRATION}; validation running")
+               f"📦 {step_label(step)} promoted — {len(shas)} commit(s) → "
+               f"{INTEGRATION} @ {gitops.current_sha(ws)[:10]}; validating")
 
 
 def cherry_pick_x(repo, sha):
@@ -780,6 +895,32 @@ def cherry_pick_x(repo, sha):
                           + (p.stderr or p.stdout).strip()[:300])
 
 
+def accepted_text(conn, step, what="ACCEPTED") -> str:
+    """The payoff message: what the step cost (tasks/commits/attempts/time)
+    and what its acceptance moves. Built AFTER the ACCEPTED transition so
+    roadmap progress counts this step."""
+    d = db.step_detail(step)
+    lines = [f"✅ {step['id']} {what} — {step['title']}"]
+    n_commits = conn.execute(
+        "SELECT COUNT(*) c FROM commits WHERE step_id=? AND integrated_sha IS NOT NULL",
+        (step["id"],)).fetchone()["c"]
+    attempts = conn.execute(
+        "SELECT COUNT(*) c FROM runs WHERE step_id=? AND role IN "
+        "('implementer','repair') AND status IN ('DONE','FAILED')",
+        (step["id"],)).fetchone()["c"]
+    first = conn.execute("SELECT MIN(ts) t FROM transitions WHERE step_id=?",
+                         (step["id"],)).fetchone()["t"]
+    if n_commits or attempts:
+        lines.append(f"{d.get('tasks_n', 1)} task(s) · {n_commits} commit(s) · "
+                     f"{attempts} attempt(s) · "
+                     f"{_fmt_dur(_mins_between(first, common.now()))} total")
+    unblocked = [sid for sid in dependents_of(conn, step["id"])
+                 if step_ready(conn, db.get_step(conn, sid))]
+    lines.append(roadmap_note(conn)
+                 + (" · unblocks: " + ", ".join(unblocked) if unblocked else ""))
+    return "\n".join(lines)
+
+
 def accept_step(ctx, conn, roadmap, step):
     scfg = step_cfg(roadmap, step["id"])
     handoff = build_handoff(ctx, conn, roadmap, step)
@@ -795,16 +936,18 @@ def accept_step(ctx, conn, roadmap, step):
                      (str(hp), step["id"]))
     soak = int(scfg.get("soak_minutes", 0) or 0)
     if soak > 0:
+        until = common.iso_in(soak * 60)
         with conn:
             conn.execute("UPDATE steps SET soak_until=? WHERE id=?",
-                         (common.iso_in(soak * 60), step["id"]))
+                         (until, step["id"]))
         db.transition(conn, ctx, step["id"], "SOAKING", f"soak {soak}m")
         tgm.notify(conn, ctx, f"soak:{step['id']}",
-                   f"engine-control: {step['id']} validated; soaking {soak}m before acceptance")
+                   f"⏳ {step['id']} validated — soaking {soak}m "
+                   f"(observation window, no action needed — "
+                   f"auto-accepts ~{common.local_when(until)})")
     else:
         db.transition(conn, ctx, step["id"], "ACCEPTED", "validated")
-        tgm.notify(conn, ctx, f"accepted:{step['id']}",
-                   f"engine-control: ✅ {step['id']} ACCEPTED — {step['title']}")
+        tgm.notify(conn, ctx, f"accepted:{step['id']}", accepted_text(conn, step))
 
 
 def build_handoff(ctx, conn, roadmap, step) -> dict:
@@ -872,7 +1015,8 @@ def start_audit(ctx, conn, roadmap, step, new_step=False):
     dispatch(ctx, conn, step, "audit", prompt, wt, "REVIEWING",
              "final independent audit dispatched", model=model, effort=effort)
     tgm.notify(conn, ctx, f"start:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step['id']} final audit started ({model})")
+               f"▶️ {step['id']} final audit started ({model}) — {step['title']}\n"
+               + roadmap_note(conn))
 
 
 def on_audit(ctx, conn, roadmap, step, run):
@@ -900,7 +1044,7 @@ def on_audit(ctx, conn, roadmap, step, run):
             if verdict == "PASS":
                 db.transition(conn, ctx, step["id"], "ACCEPTED", "audit PASS")
                 tgm.notify(conn, ctx, f"accepted:{step['id']}",
-                           f"engine-control: ✅ {step['id']} audit PASS — {step['title']}")
+                           accepted_text(conn, step, what="audit PASS"))
             else:
                 goto_blocked(ctx, conn, step, f"final audit {verdict}: "
                              + json.dumps(obj.get("findings", []))[:400])
@@ -914,6 +1058,9 @@ def on_audit(ctx, conn, roadmap, step, run):
     if tries >= REVIEWER_TRIES:
         goto_blocked(ctx, conn, step, f"audit failed {tries}x: {note[:200]}")
     else:
+        tgm.notify(conn, ctx, f"audit-retry:{step['id']}:c{d.get('cycle',0)}:{tries}",
+                   f"⚠ {step['id']} audit try {tries}/{REVIEWER_TRIES} failed "
+                   f"({note[:140]}) — retrying")
         start_audit(ctx, conn, roadmap, step)
 
 
@@ -933,7 +1080,7 @@ def notify_plan_transition(ctx, conn, view):
              "max_unknown": "Max (exact tier pending)",
              "unknown": "unknown"}.get(view.get("tier"), view.get("tier"))
     tgm.notify(conn, ctx, f"plan:{prev}->{view.get('tier')}:{view.get('detected_at')}",
-               f"engine-control: plan detection — {label} "
+               f"📊 plan detection — {label} "
                f"({view.get('confidence')}, auto). Concurrency adapts automatically; "
                "no owner action needed.")
 
@@ -942,14 +1089,17 @@ def advance_all(ctx, conn, roadmap):
     live = live_steps(conn)
     if not live:
         if db.kv_get(conn, "roadmap_started") == "1":
+            prs = [f"{r['k'].split(':', 1)[1]}: {r['v']}" for r in conn.execute(
+                "SELECT k,v FROM kv WHERE k LIKE 'pr_url:%' AND v!='' ORDER BY k")]
             tgm.notify(conn, ctx, "roadmap:complete",
-                       "engine-control: 🎉 roadmap complete — all steps accepted")
+                       "🎉 roadmap complete — all steps accepted"
+                       + ("\n" + "\n".join(prs) if prs else ""))
         return
     errs = dag_errors(roadmap)
     if errs:
         db.event(conn, ctx, "dag_error", errs=errs[:5])
         tgm.notify(conn, ctx, "dag:" + errs[0][:60],
-                   "engine-control: ⛔ roadmap DAG invalid — " + "; ".join(errs)[:300])
+                   "⛔ roadmap DAG invalid — " + "; ".join(errs)[:300])
         return
 
     view = cap.detect(ctx, conn)
@@ -963,7 +1113,7 @@ def advance_all(ctx, conn, roadmap):
                           f"{view.get('billing_overrides')}")
         tgm.notify(conn, ctx,
                    f"auth:{view.get('auth_mode')}:{'|'.join(view.get('billing_overrides') or [])}",
-                   "engine-control: ⚠ Claude auth is not subscription mode "
+                   "🔐 Claude auth is not subscription mode "
                    f"(mode={view.get('auth_mode')}, overrides={view.get('billing_overrides')}). "
                    "No work is dispatched; automatic recheck continues.")
         return
@@ -1041,10 +1191,12 @@ def step_advance_error(ctx, conn, step_id, exc):
              err=repr(exc)[:300], streak=streak, tb=common.tail(tb, 10)[:1200])
     if streak in (1, 5):
         tgm.notify(conn, ctx, f"step-err:{step_id}:{streak}",
-                   f"engine-control: ⚠ controller error advancing {step_id} "
+                   f"⚠ controller error advancing {step_id} "
                    f"x{streak}: {exc!r:.160} — other steps unaffected; "
                    f"blocks this step at x{STEP_ERR_BLOCK_AT}. /why {step_id}")
     if streak >= STEP_ERR_BLOCK_AT and step["state"] not in common.HALT_STATES:
+        d.pop("last_findings", None)  # stale findings must not steer a warm
+        db.set_detail(conn, step_id, d)  # /retry into repair; re-enter at tests
         goto_blocked(ctx, conn, step,
                      f"controller error advancing this step x{streak}: "
                      f"{exc!r:.200} — fix the controller, then /retry. "
@@ -1080,7 +1232,8 @@ def advance_step(ctx, conn, roadmap, step):
         db.transition(conn, ctx, step["id"], d.get("resume", "PENDING"),
                       "reconciled after interruption")
         tgm.notify(conn, ctx, f"recovered:{step['id']}:{common.now()[:16]}",
-                   f"engine-control: {step['id']} recovered after interruption")
+                   f"🔁 {step['id']} recovered after interruption — resuming "
+                   f"{d.get('resume', 'PENDING')}")
         return
     if state == "WAITING_USER":
         return
@@ -1094,7 +1247,7 @@ def advance_step(ctx, conn, roadmap, step):
                     return
             db.transition(conn, ctx, step["id"], "ACCEPTED", "soak complete")
             tgm.notify(conn, ctx, f"accepted:{step['id']}",
-                       f"engine-control: ✅ {step['id']} ACCEPTED — {step['title']}")
+                       accepted_text(conn, step))
         return
 
     run = db.get_run(conn, step["active_run_id"]) if step["active_run_id"] else None
@@ -1138,11 +1291,14 @@ def redispatch_stage(ctx, conn, roadmap, step, run):
         start_task_impl(ctx, conn, roadmap, step)
     elif role == "repair":
         dispatch_repair(ctx, conn, step, d.get("last_findings", "(findings lost)"),
-                        db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0)))
+                        ladder_rounds(conn, step, d))
     elif role == "diagnostic":
-        d["diagnosed"] = False
+        d.pop("diag_round", None)  # lost diagnostic: let the window re-fire it
         db.set_detail(conn, step["id"], d)
-        repair_or_block(ctx, conn, step, d.get("last_findings", "(findings lost)"))
+        # progressed: the original failure already burned (or didn't); a LOST
+        # diagnostic is an interruption, never a fresh failed attempt
+        repair_or_block(ctx, conn, step, d.get("last_findings", "(findings lost)"),
+                        progressed=True)
     elif role == "test":
         if step["state"] == "VALIDATING":
             enter_validation(ctx, conn, roadmap, step)
@@ -1159,6 +1315,7 @@ def on_planning(ctx, conn, roadmap, step, run):
         if not errs:
             pp = ctx.art / f"plan-{step['id']}.json"
             common.write_atomic(pp, json.dumps(obj, indent=1))
+            tries_used = d.get("planner_tries", 0)
             d.update(task_idx=0, tasks_n=len(obj["tasks"]), planner_tries=0)
             db.set_detail(conn, step["id"], d)
             with conn:
@@ -1170,9 +1327,18 @@ def on_planning(ctx, conn, roadmap, step, run):
                 return
             ws = Path(repo_cfg(roadmap, json.loads(step["repos"])[0])["workspace"])
             gitops.worktree_remove(ws, ctx.art / "wt" / f"{step['id']}-planner")
+            tasks = obj["tasks"]
+            multi = len({t["repo"] for t in tasks}) > 1
+            tl = [f"{i + 1}. " + (f"{t['repo']}: " if multi else "")
+                  + t["objective"].strip().splitlines()[0][:90]
+                  for i, t in enumerate(tasks[:5])]
+            if len(tasks) > 5:
+                tl.append(f"…and {len(tasks) - 5} more")
             tgm.notify(conn, ctx, f"plan:{step['id']}:c{d.get('cycle',0)}",
-                       f"engine-control: {step['id']} plan accepted "
-                       f"({len(obj['tasks'])} task(s)); implementing")
+                       f"📋 {step['id']} plan ready — {len(tasks)} task(s)"
+                       + (f" (planner attempt {tries_used + 1})" if tries_used else "")
+                       + ":\n" + "\n".join(tl)
+                       + f"\n→ implementing task 1/{len(tasks)}")
             step = db.get_step(conn, step["id"])
             start_task_impl(ctx, conn, roadmap, step)
             return
@@ -1185,6 +1351,9 @@ def on_planning(ctx, conn, roadmap, step, run):
     if tries >= PLANNER_TRIES:
         goto_blocked(ctx, conn, step, f"planner failed {tries}x: {fail_note[:200]}")
     else:
+        tgm.notify(conn, ctx, f"plan-retry:{step['id']}:c{d.get('cycle',0)}:{tries}",
+                   f"⚠ {step['id']} planner try {tries}/{PLANNER_TRIES} failed "
+                   f"({fail_note[:140]}) — retrying")
         start_planning(ctx, conn, roadmap, step)
 
 
@@ -1199,8 +1368,7 @@ def on_impl_like(ctx, conn, roadmap, step, run):
         d = db.step_detail(step)
         d["last_findings"] = findings
         db.set_detail(conn, step["id"], d)
-        dispatch_repair(ctx, conn, step, findings,
-                        db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0)))
+        dispatch_repair(ctx, conn, step, findings, ladder_rounds(conn, step, d))
         return
     if run["status"] == "FAILED":
         repair_or_block(ctx, conn, step,
@@ -1221,8 +1389,15 @@ def on_impl_like(ctx, conn, roadmap, step, run):
     if head == d["task_base"]:
         repair_or_block(ctx, conn, step, "result claims done but no commits exist in worktree")
         return
+    verb = "repaired" if run["role"] == "repair" else "implemented"
+    n_commits = len(gitops.commits_between(Path(d["task_wt"]), d["task_base"], head))
+    dur = _fmt_dur(_mins_between(run["created_at"], run["ended_at"] or common.now()))
+    an = attempts_note(conn, step)
+    summary = (obj.get("summary") or "").strip().splitlines()
     tgm.notify(conn, ctx, f"impl:{run['key']}",
-               f"engine-control: {step_label(step)} implementation finished — testing")
+               f"🔨 {step_label(step)} {verb} — testing\n"
+               f"{n_commits} commit(s) · {dur}" + (f" · {an}" if an else "")
+               + (f"\n\"{summary[0][:150]}\"" if summary else ""))
     start_testing(ctx, conn, roadmap, step)
 
 
@@ -1236,8 +1411,11 @@ def on_testing(ctx, conn, roadmap, step, run):
         return
     report = common.tail(obj.get("report"), 60)
     if obj.get("passed"):
+        dur = _fmt_dur(_mins_between(run["created_at"], run["ended_at"] or common.now()))
+        an = attempts_note(conn, step)
         tgm.notify(conn, ctx, f"tests:{run['key']}",
-                   f"engine-control: {step_label(step)} tests green — review")
+                   f"🧪 {step_label(step)} tests green ({dur}"
+                   + (f" · {an}" if an else "") + ") — review")
         start_review(ctx, conn, roadmap, step)
     elif obj.get("no_tests"):
         # Exit code 5 = the runner COLLECTED NOTHING. That is a roadmap.yaml
@@ -1246,6 +1424,9 @@ def on_testing(ctx, conn, roadmap, step, run):
         # (step-02 burned its whole budget on exactly this).
         db.set_run_note(conn, ctx, run["id"], "no tests collected (exit 5)")
         cmds = repo_cfg(roadmap, current_repo(ctx, step))["tests"]
+        d = db.step_detail(step)
+        d.pop("last_findings", None)  # engine-config problem: a warm /retry
+        db.set_detail(conn, step["id"], d)  # must re-enter at TESTING, not repair
         goto_blocked(ctx, conn, step,
                      "test harness collected NO TESTS (exit code 5) — the "
                      f"roadmap.yaml test command(s) {json.dumps(cmds)} match "
@@ -1254,17 +1435,37 @@ def on_testing(ctx, conn, roadmap, step, run):
     else:
         db.set_run_note(conn, ctx, run["id"],
                         "tests failed: " + _fail_lines(report, 3))
+        an = attempts_note(conn, step)
+        hits = "\n".join(h[:160] for h in _fail_hits(report)[:3])
         tgm.notify(conn, ctx, f"tests:{run['key']}",
-                   f"engine-control: {step_label(step)} tests FAILED — repair path")
+                   f"❌ {step_label(step)} tests FAILED"
+                   + (f" ({an})" if an else "") + " — repair path"
+                   + (f"\n{hits}" if hits else ""))
         repair_or_block(ctx, conn, step, "tests failed:\n" + report)
 
 
-def _fail_lines(report: str, n: int) -> str:
-    """First n lines that look like actual failures — the part of a test
-    report a human wants first."""
-    hits = [l.strip() for l in (report or "").splitlines()
+def _fail_hits(report: str) -> list[str]:
+    """The lines of a test report that look like actual failures — the part
+    a human wants first."""
+    return [l.strip() for l in (report or "").splitlines()
             if re.search(r"FAIL|ERROR|Error|error:|failed|rc=[1-9]", l)]
-    return " | ".join(hits[:n]) or (report or "").strip()[:200]
+
+
+def _fail_lines(report: str, n: int) -> str:
+    return " | ".join(_fail_hits(report)[:n]) or (report or "").strip()[:200]
+
+
+def _findings_lines(obj, n=2) -> list[str]:
+    """Top review findings as owner-readable bullets (severity: issue)."""
+    fs = obj.get("findings") or []
+    out = []
+    for f in fs[:n]:
+        sev = f.get("severity") if isinstance(f, dict) else None
+        issue = f.get("issue", "") if isinstance(f, dict) else str(f)
+        out.append(("• " + (f"{sev}: " if sev else "") + issue)[:170])
+    if len(fs) > n:
+        out.append(f"…and {len(fs) - n} more (/why for artifacts)")
+    return out
 
 
 def on_review(ctx, conn, roadmap, step, run):
@@ -1276,8 +1477,17 @@ def on_review(ctx, conn, roadmap, step, run):
             d["reviewer_tries"] = 0
             db.set_detail(conn, step["id"], d)
             verdict = obj["verdict"]
+            nf = len(obj.get("findings") or [])
+            an = attempts_note(conn, step)
+            if verdict == "PASS":
+                txt = (f"🔍 {step_label(step)} review PASS"
+                       + (f" ({nf} advisory finding(s))" if nf else "")
+                       + " — promoting to integration")
+            else:
+                txt = (f"🔍 {step_label(step)} review {verdict} — {nf} finding(s)\n"
+                       + "\n".join(_findings_lines(obj)))
             tgm.notify(conn, ctx, f"review:{run['key']}",
-                       f"engine-control: {step_label(step)} review: {verdict}")
+                       txt + (f"\n{an}" if an else ""))
             repo = current_repo(ctx, step)
             ws = Path(repo_cfg(roadmap, repo)["workspace"])
             gitops.worktree_remove(
@@ -1285,9 +1495,30 @@ def on_review(ctx, conn, roadmap, step, run):
             if verdict == "PASS":
                 enter_validation(ctx, conn, roadmap, step)
             elif verdict == "REPAIR":
-                repair_or_block(ctx, conn, step,
-                                "REVIEW FINDINGS:\n" + json.dumps(obj["findings"], indent=1)[:4000])
+                gating = [f for f in obj["findings"] if not isinstance(f, dict)
+                          or f.get("severity") in ("critical", "major")]
+                if not gating:
+                    # severity is a promotion gate: minor/info-only REPAIR is
+                    # advisory — promote with notes instead of burning rounds
+                    # on polish the acceptance bar does not require
+                    db.event(conn, ctx, "review_advisory", step_id=step["id"], n=nf)
+                    tgm.notify(conn, ctx, f"advisory:{run['key']}",
+                               f"🔍 {step_label(step)} all {nf} finding(s) "
+                               "minor/info — advisory only; promoting "
+                               "(notes stay in the review artifact)")
+                    enter_validation(ctx, conn, roadmap, step)
+                else:
+                    # a repair that reached green tests and an independent
+                    # review did real work; NEW findings are progress, not a
+                    # burned attempt
+                    repair_or_block(ctx, conn, step,
+                                    "REVIEW FINDINGS:\n"
+                                    + json.dumps(obj["findings"], indent=1)[:4000],
+                                    progressed=True)
             else:
+                d["last_findings"] = ("REVIEW BLOCK:\n"
+                                      + json.dumps(obj["findings"], indent=1)[:4000])
+                db.set_detail(conn, step["id"], d)
                 goto_blocked(ctx, conn, step,
                              "reviewer BLOCK: " + json.dumps(obj["findings"])[:300])
             return
@@ -1300,6 +1531,9 @@ def on_review(ctx, conn, roadmap, step, run):
     if tries >= REVIEWER_TRIES:
         goto_blocked(ctx, conn, step, f"reviewer failed {tries}x: {note[:200]}")
     else:
+        tgm.notify(conn, ctx, f"review-retry:{step['id']}:c{d.get('cycle',0)}:{tries}",
+                   f"⚠ {step_label(step)} reviewer try {tries}/{REVIEWER_TRIES} "
+                   f"failed ({note[:140]}) — retrying")
         start_review(ctx, conn, roadmap, step)
 
 
@@ -1329,8 +1563,9 @@ def on_validating(ctx, conn, roadmap, step, run):
         db.set_detail(conn, step["id"], d)
         n = d.get("tasks_n", 1)
         tgm.notify(conn, ctx, f"task:{step['id']}:c{d.get('cycle',0)}t{idx}:done",
-                   f"engine-control: {step['id']} task {idx + 1}/{n} integrated and "
-                   "validated" + (" — step continues" if len(done) < n else ""))
+                   f"☑️ {step['id']} task {idx + 1}/{n} integrated and validated"
+                   + (f" — step continues: task {len(done) + 1}/{n} next"
+                      if len(done) < n else ""))
     if len(done) < d.get("tasks_n", 1):
         step = db.get_step(conn, step["id"])
         start_task_impl(ctx, conn, roadmap, step, task_idx=len(done))
@@ -1344,24 +1579,84 @@ TIER_LABEL = {"max20": "Max 20x", "max5": "Max 5x", "pro": "Pro",
               "max_unknown": "Max (exact tier pending)", "unknown": "unknown"}
 
 
+ACTIVE_TASK_STATES = ("IMPLEMENTING", "TESTING", "REPAIRING", "REVIEWING",
+                      "VALIDATING")
+STATE_MARK = {"ACCEPTED": "✅", "BLOCKED": "⛔", "ABORTED": "🛑",
+              "SOAKING": "⏳", "WAITING_QUOTA": "⌛", "INTERRUPTED": "🔌",
+              "PENDING": "·"}
+
+
+def _state_age_min(conn, step):
+    """Minutes since the step entered its current state (transition ledger)."""
+    t = conn.execute(
+        "SELECT ts FROM transitions WHERE step_id=? AND to_state=? "
+        "ORDER BY id DESC LIMIT 1", (step["id"], step["state"])).fetchone()
+    return _mins_between(t["ts"], common.now()) if t else None
+
+
+def step_line(conn, s) -> str:
+    """One /status line per step: state, task/attempt/retry position, time in
+    state or the timer it waits on, unmet dependencies for PENDING."""
+    d = db.step_detail(s)
+    st = s["state"]
+    if st == "ACCEPTED":
+        return f"✅ {s['id']} — {s['title']}"
+    bits = []
+    word = st
+    if st == "PENDING":
+        waits = [str(x).split(":")[0] for x in json.loads(s["depends_on"] or "[]")
+                 if not dep_satisfied(conn, x)]
+        word = "PENDING" if waits else "READY"
+        if waits:
+            bits.append("waits " + "+".join(waits))
+    elif st == "SOAKING":
+        # Validated + integrated; only the observation window remains. Ladder/
+        # retry history here reads as a live problem, so the line says the one
+        # thing that matters: it finishes by itself, and when.
+        when = (f"auto-accepts {common.local_when(s['soak_until'])}"
+                if s["soak_until"] else "auto-accepts at soak end")
+        bits.append(f"validated — {when} · no action needed")
+    else:
+        n = d.get("tasks_n", 0)
+        if n > 1 and st in ACTIVE_TASK_STATES:
+            bits.append(f"task {d.get('task_idx', 0) + 1}/{n}")
+        rounds = ladder_rounds(conn, s, d)
+        if rounds:
+            bits.append(f"round {rounds}")
+        if d.get("burned"):
+            bits.append(f"{d['burned']}/{LADDER_MAX} hard-failed")
+        if d.get("cycle"):
+            bits.append(f"retry {d['cycle']}")
+        if st == "WAITING_QUOTA" and s["retry_at"]:
+            bits.append(f"retry {common.local_when(s['retry_at'])}")
+        else:
+            age = _state_age_min(conn, s)
+            if age is not None and age >= 1:
+                bits.append(_fmt_dur(age))
+    mark = STATE_MARK.get(st, "⌛" if st in common.WAITING_STATES else "▶")
+    return (f"{mark} {s['id']} {word}"
+            + (" · " + " · ".join(bits) if bits else "") + f" — {s['title']}")
+
+
 def status_text(ctx, conn) -> str:
-    lines = []
+    steps = steps_all(conn)
+    acc = sum(1 for s in steps if s["state"] == "ACCEPTED")
     started = db.kv_get(conn, "roadmap_started") == "1"
     paused = db.kv_get(conn, "paused") == "1"
     run_id = db.kv_get(conn, "roadmap_run_id") or "-"
-    lines.append(f"engine-control — roadmap {'started' if started else 'NOT started'}"
-                 f"{' [PAUSED]' if paused else ''} (run {run_id})")
+    word = "NOT STARTED" if not started else ("PAUSED" if paused else "RUNNING")
+    lines = [f"engine-control {word} · {acc}/{len(steps)} accepted · {run_id}"]
     gov, ready, view, usage = gov_now(ctx, conn)
     mode = "auto" if not gov["override"] else f"override:{gov['override']}"
-    lines.append(f"Plan: {TIER_LABEL.get(gov['tier'], gov['tier'])} "
+    lines.append(f"plan {TIER_LABEL.get(gov['tier'], gov['tier'])} "
                  f"({mode}, {view.get('confidence', '?')}) · auth {view.get('auth_mode', '?')}")
     if usage:
         stale = " STALE" if usage.get("stale") else ""
-        lines.append(f"Usage: 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
-                     f" (age {int(usage.get('age_min', 0))}m{stale}, {usage.get('source')})")
+        lines.append(f"usage 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
+                     f" ({int(usage.get('age_min', 0))}m ago{stale}, {usage.get('source')})")
     else:
-        lines.append("Usage: no telemetry yet")
-    lines.append(f"Claude workers: {gov['active']} active · target {gov['target']}"
+        lines.append("usage: no telemetry yet")
+    lines.append(f"workers {gov['active']} active / target {gov['target']}"
                  f" · pressure {gov['pressure']} · pace {gov['pace']} (/workers)")
     if gov["active"] == 0 and started:
         lines.append(f"   idle — {idle_reason(conn, gov, ready)}")
@@ -1369,17 +1664,9 @@ def status_text(ctx, conn) -> str:
            conn.execute("SELECT k,v FROM kv WHERE k LIKE 'pr_number:%' AND v!='' "
                         "ORDER BY k")]
     if prs:
-        lines.append("GitHub PRs: " + " · ".join(prs) + " (/prs for links)")
-    if ready:
-        lines.append(f"READY: {', '.join(ready)}")
-    for s in conn.execute("SELECT * FROM steps ORDER BY ordinal"):
-        d = db.step_detail(s)
-        pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
-        mark = {"ACCEPTED": "✅", "BLOCKED": "⛔", "ABORTED": "🛑"}.get(s["state"], "·")
-        n = d.get("tasks_n", 0)
-        prog = (f" · task {d.get('task_idx', 0) + 1}/{n}" if n > 1 and s["state"] in
-                ("IMPLEMENTING", "TESTING", "REPAIRING", "REVIEWING", "VALIDATING") else "")
-        lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos}{prog} — {s['title']}")
+        lines.append("PRs: " + " · ".join(prs) + " (/prs for links)")
+    for s in steps:
+        lines.append(step_line(conn, s))
         if s["state"] == "BLOCKED":
             why = conn.execute(
                 "SELECT reason FROM transitions WHERE step_id=? AND to_state='BLOCKED' "
@@ -1397,7 +1684,7 @@ def status_text(ctx, conn) -> str:
                              f"since {common.local_str(r['created_at'], '%m-%d %H:%M')}")
     if not tgm.from_ctx(ctx):
         lines.append("⚠ telegram: WAITING_CONFIG (see README)")
-    return "\n".join(lines)
+    return "\n".join(lines)[:3900]  # telegram hard limit 4096
 
 
 def _run_outcome(conn, run) -> str:
@@ -1506,7 +1793,7 @@ def idle_reason(conn, gov, ready) -> str:
         return f"PAUSED: {why} — /resume to continue"
     hold = db.kv_get(conn, "quota_hold_until")
     if hold and not common.is_past(hold):
-        return f"quota hold until {common.local_str(hold)}"
+        return f"quota hold until {common.local_when(hold)}"
     if gov["target"] == 0:
         return f"dispatch target 0 (pressure {gov['pressure']})"
     if not ready:
@@ -1519,8 +1806,10 @@ def workers_text(ctx, conn, probe=None) -> str:
     with process liveness (probe) + statusline heartbeat age, the idle reason
     when nothing runs, and the last few finished runs with outcomes."""
     probe = probe or cr.probe
+    gov, ready, _, _ = gov_now(ctx, conn)
     runs = [r for r in db.open_runs(conn) if r["role"] != "probe"]
-    lines = [f"workers: {len(runs)} active"]
+    lines = [f"workers: {len(runs)} active · target {gov['target']}"
+             f" · pace {gov['pace']}"]
     for r in runs:
         phase = probe(ctx, r)["phase"]
         el = _mins_between(r["created_at"], common.now()) or 0
@@ -1541,7 +1830,6 @@ def workers_text(ctx, conn, probe=None) -> str:
         lines.append(f"   {r['key']} · {r['lane']} lane"
                      + (f" — [{step['state']}] {step['title']}" if step else ""))
     if not runs:
-        gov, ready, _, _ = gov_now(ctx, conn)
         lines.append("none — " + idle_reason(conn, gov, ready))
     done = conn.execute(
         "SELECT * FROM runs WHERE status NOT IN ('PREPARED','DISPATCHED') "
@@ -1550,8 +1838,10 @@ def workers_text(ctx, conn, probe=None) -> str:
         lines.append("recent:")
         for r in done[::-1]:
             who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+            dur = _mins_between(r["created_at"], r["ended_at"]) if r["ended_at"] else None
             lines.append(f"· {common.local_str(r['ended_at'] or r['created_at'])} "
-                         f"{r['step_id']} {who} [{r['status']}] "
+                         f"{r['step_id']} {who} [{r['status']}]"
+                         + (f" {_fmt_dur(dur)}" if dur is not None else "") + " "
                          f"{_run_outcome(conn, r)[:120]}")
     return "\n".join(lines)[:3900]  # telegram hard limit 4096
 
@@ -1575,6 +1865,17 @@ def why_text(ctx, conn, step_id=None) -> str:
     d = db.step_detail(step)
     cycle = d.get("cycle", 0)
     lines = [f"why {step['id']} — [{step['state']}] cycle {cycle} — {step['title']}"]
+    if step["state"] == "SOAKING":
+        when = (common.local_when(step["soak_until"]) if step["soak_until"]
+                else "soak end")
+        lines.append("soaking = post-validation observation window: the work is "
+                     "integrated and test-green; it runs in reality for the "
+                     f"configured soak_minutes, then accepts itself ~{when}. "
+                     "No action needed; the history below is how it got here.")
+    if d.get("task_wt"):
+        lines.append(f"ladder: round {ladder_rounds(conn, step, d)} this grant · "
+                     f"{d.get('burned', 0)}/{LADDER_MAX} hard-failed · "
+                     f"fuse {ctx.getenv('EC_LADDER_TOTAL_MAX', str(LADDER_TOTAL_MAX))} rounds")
     for t in conn.execute(
             "SELECT * FROM transitions WHERE step_id=? ORDER BY id DESC LIMIT 3",
             (step["id"],)).fetchall()[::-1]:
@@ -1600,13 +1901,78 @@ def why_text(ctx, conn, step_id=None) -> str:
 
 
 def rearm_step(ctx, conn, step) -> str:
-    d = {"cycle": db.step_detail(step).get("cycle", 0) + 1}
+    d = db.step_detail(step)
+    wt = d.get("task_wt")
+    if step["plan_path"] and wt and Path(wt).exists():
+        # Warm resume: the cycle's plan, worktree and every commit survive a
+        # BLOCK — /retry refreshes the failure budget and continues in-place
+        # (at repair when findings are known, else re-proving from tests)
+        # instead of replanning from scratch (owner finding 2026-08-10).
+        cyc = d.get("cycle", 0)
+        d.update(burned=0, burn_mark=None, diag_round=0,
+                 rung_floor=db.ladder_pos(conn, step["id"],
+                                          d.get("task_idx", 0), cyc))
+        d.pop("advance_err_streak", None)
+        db.set_detail(conn, step["id"], d)
+        with conn:
+            conn.execute("UPDATE steps SET active_run_id=NULL WHERE id=?",
+                         (step["id"],))
+        to = "REPAIRING" if d.get("last_findings") else "TESTING"
+        db.transition(conn, ctx, step["id"], to,
+                      "/retry — warm resume, budget refreshed")
+        return (f"{step['id']} resuming in-place at "
+                f"{'repair' if to == 'REPAIRING' else 'tests'} — "
+                f"{d['rung_floor']} round(s) of work kept, budget refreshed")
+    d = {"cycle": d.get("cycle", 0) + 1}
     db.set_detail(conn, step["id"], d)
     with conn:
         conn.execute("UPDATE steps SET active_run_id=NULL, plan_path=NULL WHERE id=?",
                      (step["id"],))
     db.transition(conn, ctx, step["id"], "PENDING", "/retry — fresh cycle")
-    return f"{step['id']} re-armed (cycle {d['cycle']})"
+    return f"{step['id']} re-armed from scratch (cycle {d['cycle']})"
+
+
+def help_text() -> str:
+    return (
+        "engine-control commands:\n"
+        "/status — roadmap, plan, usage, every step\n"
+        "/workers — live workers + recent runs\n"
+        "/why [step] — failure story (default: last halted)\n"
+        "/retry [step] — resume BLOCKED/ABORTED steps in-place (work kept; "
+        "replans from scratch only when the worktree is gone)\n"
+        "/abort [step] — stop a step for good (dependents halt)\n"
+        "/pause · /resume — dispatch gate (running workers finish)\n"
+        "/prs — GitHub PRs for validated work\n"
+        "/log — recent engine events\n"
+        f"/profile auto|{'|'.join(sorted(cap.ENVELOPES))} — plan override (debug)\n"
+        "/pace auto|economy|balanced|sprint — dispatch pace")
+
+
+def _fmt_event(r) -> str:
+    """One human line per events row for /log — the raw table is JSON the
+    owner should never have to parse on a phone."""
+    try:
+        p = json.loads(r["payload"]) if r["payload"] else {}
+    except ValueError:
+        p = {}
+    k, s = r["kind"], (r["step_id"] or "")
+    if k == "dispatched":
+        return f"{s}: → {p.get('role')}/{p.get('model')} ({p.get('frm')}→{p.get('to')})"
+    if k in ("run_done", "run_failed", "run_quota", "run_lost"):
+        note = str(p.get("note") or "").replace("\n", " ")[:90]
+        return f"{s}: run {k[4:].upper()}" + (f" — {note}" if note else "")
+    if k == "transition":
+        why = str(p.get("reason") or "").replace("\n", " ")[:90]
+        return f"{s}: {p.get('frm')}→{p.get('to')}" + (f" — {why}" if why else "")
+    if k == "tg_command":
+        return f"cmd {p.get('cmd')}" + (f" {p.get('arg')}" if p.get("arg") else "")
+    if k == "pr_pushed":
+        return (f"{p.get('repo')}: pushed {str(p.get('sha'))[:10]} "
+                f"({p.get('commits')} commits)")
+    if k == "advance_error":
+        return f"{s}: ⚠ x{p.get('streak')} {str(p.get('err'))[:90]}"
+    kv = " ".join(f"{a}={str(b)[:40]}" for a, b in list(p.items())[:4])
+    return f"{s}: {k} {kv}".strip() if s else f"{k} {kv}".strip()
 
 
 def handle_commands(ctx, conn, tg, cmds):
@@ -1623,7 +1989,9 @@ def handle_commands(ctx, conn, tg, cmds):
             db.kv_set(conn, "paused", "1")
             db.kv_set(conn, "paused_why",
                       f"/pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
-            tg.send("engine-control: paused (running workers finish; no new dispatch)")
+            running = len([r for r in db.open_runs(conn) if r["role"] != "probe"])
+            tg.send(f"⏸ paused — {running} running worker(s) will finish; "
+                    "no new dispatch. /resume to continue")
         elif name == "/resume":
             db.kv_set(conn, "paused", "0")
             db.kv_set(conn, "paused_why", "")
@@ -1631,58 +1999,58 @@ def handle_commands(ctx, conn, tg, cmds):
                 if step["state"] == "WAITING_USER":
                     db.transition(conn, ctx, step["id"],
                                   db.step_detail(step).get("resume", "PENDING"), "/resume")
-            tg.send("engine-control: resumed")
+            tg.send("▶️ resumed — dispatch continues next tick")
         elif name == "/retry":
             halted = [s for s in steps_all(conn) if s["state"] in common.HALT_STATES
                       and (arg is None or s["id"] == arg)]
             if halted:
-                tg.send("engine-control: " + "; ".join(
-                    rearm_step(ctx, conn, s) for s in halted))
+                tg.send("🔁 " + "; ".join(rearm_step(ctx, conn, s) for s in halted))
             else:
-                tg.send("engine-control: no BLOCKED/ABORTED step"
+                tg.send("no BLOCKED/ABORTED step"
                         + (f" named {arg}" if arg else "") + " to retry")
         elif name == "/abort":
             targets = [s for s in live_steps(conn)
                        if s["state"] not in common.HALT_STATES
                        and (arg is None or s["id"] == arg)]
             if arg is None and len(targets) > 1:
-                tg.send("engine-control: several steps active — use /abort <step-id>: "
+                tg.send("several steps active — use /abort <step-id>: "
                         + ", ".join(s["id"] for s in targets))
             elif targets:
                 for s in targets:
                     db.transition(conn, ctx, s["id"], "ABORTED", "/abort")
-                tg.send("engine-control: aborted " + ", ".join(s["id"] for s in targets)
+                tg.send("🛑 aborted " + ", ".join(s["id"] for s in targets)
                         + " (dependents will not start)")
             else:
-                tg.send("engine-control: nothing to abort" + (f" ({arg})" if arg else ""))
+                tg.send("nothing to abort" + (f" ({arg})" if arg else ""))
         elif name == "/profile":
             if arg in (None, "auto"):
                 db.kv_set(conn, "plan_override", "")
-                tg.send("engine-control: plan detection AUTO (override cleared)")
+                tg.send("plan detection AUTO (override cleared)")
             elif arg in cap.ENVELOPES:
                 db.kv_set(conn, "plan_override", arg)
-                tg.send(f"engine-control: plan OVERRIDE {arg} (debug only — "
+                tg.send(f"plan OVERRIDE {arg} (debug only — "
                         "/profile auto to return to automatic detection)")
             else:
-                tg.send(f"engine-control: unknown profile '{arg}' "
+                tg.send(f"unknown profile '{arg}' "
                         f"(auto|{'|'.join(sorted(cap.ENVELOPES))})")
         elif name == "/pace":
             if arg in (None, "auto"):
                 db.kv_set(conn, "pace", "auto")
-                tg.send("engine-control: pace AUTO")
+                tg.send("pace AUTO")
             elif arg in ("economy", "balanced", "sprint"):
                 db.kv_set(conn, "pace", arg)
-                tg.send(f"engine-control: pace {arg}")
+                tg.send(f"pace {arg}")
             else:
-                tg.send("engine-control: /pace auto|economy|balanced|sprint")
+                tg.send("/pace auto|economy|balanced|sprint")
         elif name == "/why":
             tg.send(why_text(ctx, conn, arg))
+        elif name == "/help" or name == "/start":
+            tg.send(help_text())
         elif name == "/log":
             rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
-            out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {r['kind']} "
-                            f"{r['step_id'] or ''} {(r['payload'] or '')[:160]}"
+            out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {_fmt_event(r)}"
                             for r in rows[::-1])
-            tg.send(out or "no events")
+            tg.send((out or "no events")[:3900])
         elif name == "/prs":
             repos = sorted({r["k"].split(":", 1)[1] for r in conn.execute(
                 "SELECT k FROM kv WHERE k LIKE 'pr_tip:%' OR k LIKE 'pr_url:%'")})
@@ -1695,8 +2063,10 @@ def handle_commands(ctx, conn, tg, cmds):
             if out:
                 tg.send("engine-control PRs:\n" + "\n".join(out))
             else:
-                tg.send("engine-control: no validated automation work has "
-                        "reached GitHub yet (PRs open on the first validated task)")
+                tg.send("no validated automation work has reached GitHub yet "
+                        "(PRs open on the first validated task)")
+        else:
+            tg.send(f"unknown command {name} — /help lists commands")
 
 
 # ---------- tick ----------
@@ -1783,7 +2153,7 @@ def tick(ctx) -> int:
             db.event(conn, ctx, "advance_error", err=repr(e)[:400], streak=streak)
             if streak in (1, 5):
                 tgm.notify(conn, ctx, f"orch-error:{episode}:{streak}",
-                           f"engine-control: orchestration error x{streak}: {e!r:.200}")
+                           f"⚠ orchestration error x{streak}: {e!r:.200}")
             if streak >= 8:
                 # never block a healthy step over a controller bug: with the
                 # DAG scheduler the safe containment is pausing dispatch
@@ -1792,7 +2162,7 @@ def tick(ctx) -> int:
                     db.kv_set(conn, "paused_why",
                               f"auto-pause: persistent controller error x{streak}")
                     tgm.notify(conn, ctx, f"orch-pause:{episode}",
-                               "engine-control: persistent controller error — dispatch "
+                               "⏸ persistent controller error — dispatch "
                                "PAUSED (running workers finish). /resume after repair.")
         tgm.flush(ctx, conn, tg)
         conn.close()

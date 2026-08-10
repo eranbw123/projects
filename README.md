@@ -52,19 +52,27 @@ python control.py status         # roadmap + step + active-run overview
 python control.py workers        # live workers: liveness, heartbeat, idle reason
 python control.py pause          # stop dispatching (running workers finish)
 python control.py resume         # resume dispatching
-python control.py retry          # re-arm a BLOCKED step (fresh cycle)
+python control.py retry          # resume a BLOCKED step in-place (budget refreshed)
 python control.py abort          # abort the active step, halt roadmap
 python control.py log            # recent event ledger
 python control.py install-task   # install the once-per-minute tick task
 python control.py uninstall-task
 ```
 
-Telegram commands: `/status /workers /pause /resume /log /prs`, `/retry [step-id]`
-(`/workers` shows each live worker's role, elapsed time, deadline, process
-liveness, and statusline heartbeat — and, when idle, the reason nothing runs),
-(re-arm BLOCKED steps), `/abort [step-id]` (abort one step; its dependents
-never start; independent branches continue), `/profile auto|max5|max20|pro`
-(capacity override — debug only), `/pace auto|economy|balanced|sprint`.
+Telegram commands: `/status /workers /why /help /pause /resume /log /prs`,
+`/retry [step-id]` (resume BLOCKED steps in-place — work kept, budget
+refreshed; replans from scratch only when the worktree is gone),
+`/abort [step-id]` (abort one step;
+its dependents never start; independent branches continue),
+`/profile auto|max5|max20|pro` (capacity override — debug only),
+`/pace auto|economy|balanced|sprint`. `/workers` shows each live worker's
+role, elapsed time, deadline, process liveness, and heartbeat — and, when
+idle, the reason nothing runs. `/why [step]` narrates a step's failure story.
+Unknown slash commands answer with a `/help` pointer. Event notifications
+lead with a semantic emoji (▶️ start, 📋 plan, 🔨 built, 🧪/❌ tests, 🔍
+review, 🛠 repair, 📦 promoted, ☑️ task done, ✅ accepted, ⛔ blocked) and
+carry ladder round / retry counts, durations, commit counts, and roadmap
+progress.
 
 Commands answer within a few seconds: a long-poll listener
 (`tg_listener.py`, supervised by the `engine-control-listener` task) wakes
@@ -143,7 +151,7 @@ Worker or GitHub failures notify once, back off, and never pause development.
 There is nothing to do manually. Every dispatch has a deterministic key and
 on-disk evidence (`artifacts/runs/<key>/`); after any crash/sleep/reboot the
 next tick adopts finished work, marks vanished workers LOST → step
-INTERRUPTED → respawns without consuming an attempt. If a step is BLOCKED,
+INTERRUPTED → respawns without consuming repair budget. If a step is BLOCKED,
 read `/status` + `/log`, then `/retry` or `/abort`. To inspect deeply:
 `state.db` (tables: steps, runs, events, transitions, commits, notifications).
 
@@ -188,13 +196,45 @@ resolves through the conflict → repair path (never a reset). Quota/limit hits
 → `WAITING_QUOTA` (persisted, notified, retried; never counts as a failed
 attempt, never falls back to API billing).
 
+## Step lifecycle & soaking
+
+A step flows PENDING → PLANNING → IMPLEMENTING → TESTING → REVIEWING (→
+REPAIRING as needed) → VALIDATING → ACCEPTED; `/status` shows every state.
+Two of them are easy to misread:
+
+- **SOAKING** — the step is *finished and validated*: commits are integrated
+  on `automation/integration`, integration tests are green, and the normal PR
+  push carries the work. Steps with `soak_minutes:` in `roadmap.yaml` then
+  hold in a real-time observation window before ACCEPTED — e.g. step-01
+  deploys always-on scheduled tasks, so it soaks 24h to prove recovery and
+  health in reality, not just in tests. **There is no owner action**: the
+  step accepts itself when the window ends (`/status` shows the exact time).
+  An optional `soak_check:` command runs at the end of the window; if it
+  fails, the step routes into the normal repair ladder instead of accepting.
+- **WAITING_\*** (config/quota/auth) — external waits. They resume
+  automatically, never consume repair budget, and only WAITING_CONFIG asks
+  anything of the owner (fill `.env`).
+
+Dependencies gate on acceptance: `depends_on: [step-x]` waits for ACCEPTED,
+while `step-x:validated` is satisfied once step-x reaches SOAKING — dependents
+that only need the code, not the soak evidence, start immediately.
+
 ## Repair ladder
 
-implementation → repair 1 (resumes implementer session) → repair 2 (fresh
-session) → independent diagnostic (Opus, read-only) → final targeted repair →
-BLOCKED. Waits/interruptions never consume rungs. A BLOCKED step blocks only
-its dependents — steps on independent branches continue; dependents are never
-started over a failed dependency.
+implementation → repair rounds (first one resumes the implementer's session) →
+independent diagnostic (Opus, read-only) every 3rd round → BLOCKED only when
+the budget is spent. The budget counts HOW a round failed, not that it ran:
+only hard failures (worker died, no commits, tests red) burn one of 4 rungs; a
+round that produced real work — commits, green tests — before an independent
+review found NEW gating defects is the process converging and burns nothing. A
+total-rounds fuse (`EC_LADDER_TOTAL_MAX`, default 10) still terminates endless
+always-something review loops. Review severity is a promotion gate: a REPAIR
+verdict whose findings are all minor/info promotes with advisory notes instead
+of spending a round. Waits/interruptions never consume budget. `/retry` of a
+BLOCKED step resumes in-place — same cycle, plan, worktree, and commits, with
+the budget refreshed; it replans from scratch only when the worktree no longer
+exists. A BLOCKED step blocks only its dependents — steps on independent
+branches continue; dependents are never started over a failed dependency.
 
 ## Tests
 
