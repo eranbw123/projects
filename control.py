@@ -1283,7 +1283,8 @@ def status_text(ctx, conn) -> str:
         if s["active_run_id"]:
             r = db.get_run(conn, s["active_run_id"])
             if r and r["status"] in ("PREPARED", "DISPATCHED"):
-                lines.append(f"   run {r['key']} ({r['role']}/{r['model']}) since {r['created_at']}")
+                lines.append(f"   run {r['key']} ({r['role']}/{r['model']}) "
+                             f"since {common.local_str(r['created_at'], '%m-%d %H:%M')}")
     if not tgm.from_ctx(ctx):
         lines.append("⚠ telegram: WAITING_CONFIG (see README)")
     return "\n".join(lines)
@@ -1362,8 +1363,9 @@ def handle_commands(ctx, conn, tg, cmds):
                 tg.send("engine-control: /pace auto|economy|balanced|sprint")
         elif name == "/log":
             rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
-            out = "\n".join(f"{r['ts'][11:19]} {r['kind']} {r['step_id'] or ''} "
-                            f"{(r['payload'] or '')[:80]}" for r in rows[::-1])
+            out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {r['kind']} "
+                            f"{r['step_id'] or ''} {(r['payload'] or '')[:80]}"
+                            for r in rows[::-1])
             tg.send(out or "no events")
 
 
@@ -1653,7 +1655,8 @@ def main(argv=None):
         handle_commands(ctx, conn, _T(), ["/abort"])
     elif args.cmd == "log":
         for r in conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 30").fetchall()[::-1]:
-            print(f"{r['ts']} {r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:100]}")
+            print(f"{common.local_str(r['ts'], '%Y-%m-%d %H:%M:%S')} "
+                  f"{r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:100]}")
     elif args.cmd == "telegram-detect-chat":
         tok = ctx.getenv("DEV_TELEGRAM_BOT_TOKEN")
         if not tok:

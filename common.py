@@ -56,6 +56,14 @@ def is_past(iso: str) -> bool:
     return datetime.now(timezone.utc) >= parse_iso(iso)
 
 
+def local_str(iso: str, fmt: str = "%H:%M") -> str:
+    """UTC-stored timestamp -> machine-local display (owner-facing text)."""
+    try:
+        return parse_iso(iso).astimezone().strftime(fmt)
+    except (ValueError, TypeError):
+        return str(iso or "")
+
+
 def load_env_file(path: Path) -> dict:
     env = {}
     if path.exists():
