@@ -24,6 +24,7 @@ import db
 import ghdocs
 import ghpr
 import gitops
+import newsops
 import telegram as tgm
 import validators as vd
 
@@ -1997,7 +1998,9 @@ def help_text() -> str:
         "/prs — GitHub PRs for validated work\n"
         "/log — recent engine events\n"
         f"/profile auto|{'|'.join(sorted(cap.ENVELOPES))} — plan override (debug)\n"
-        "/pace auto|economy|balanced|sprint — dispatch pace")
+        "/pace auto|economy|balanced|sprint — dispatch pace\n"
+        "/news — the deployed discovery appliance: status, manual runs, "
+        "settings (/news help)")
 
 
 def _fmt_event(r) -> str:
@@ -2103,6 +2106,9 @@ def handle_commands(ctx, conn, tg, cmds):
             out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {_fmt_event(r)}"
                             for r in rows[::-1])
             tg.send((out or "no events")[:3900])
+        elif name == "/news":
+            tg.send(newsops.command(ctx, parts[1] if len(parts) > 1 else "",
+                                    parts[2:]))
         elif name == "/prs":
             repos = sorted({r["k"].split(":", 1)[1] for r in conn.execute(
                 "SELECT k FROM kv WHERE k LIKE 'pr_tip:%' OR k LIKE 'pr_url:%'")})
@@ -2455,9 +2461,11 @@ def main(argv=None):
     ap.add_argument("cmd", choices=["tick", "start", "status", "workers", "why",
                                     "pause", "resume", "retry", "abort", "log", "init",
                                     "doctor", "install-task", "uninstall-task",
-                                    "telegram-detect-chat"])
+                                    "telegram-detect-chat", "news"])
     ap.add_argument("target", nargs="?", default=None,
-                    help="step id for `why` (default: last halted step)")
+                    help="step id for `why`; subcommand for `news`")
+    ap.add_argument("extra", nargs="*", default=[],
+                    help="extra arguments for `news` (e.g. set bar <key> <value>)")
     ap.add_argument("--root", default=None)
     args = ap.parse_args(argv)
     ctx = make_ctx(args.root)
@@ -2475,6 +2483,9 @@ def main(argv=None):
         return cmd_install_task(ctx)
     if args.cmd == "uninstall-task":
         return cmd_uninstall_task(ctx)
+    if args.cmd == "news":
+        print(newsops.command(ctx, args.target or "", args.extra))
+        return 0
     conn = db.connect(ctx)
     if args.cmd == "status":
         print(status_text(ctx, conn))

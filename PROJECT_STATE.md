@@ -173,6 +173,20 @@ Not subscription (api key/gateway env/logged out) → all steps WAITING_AUTH,
 notify once, auto-recheck; `cmd_start` refuses launch. WAITING_AUTH is a
 WAITING state (never consumes repair budget).
 
+## /news — owner control panel for the deployed appliance (2026-08-10)
+`newsops.py` (tg `/news` + CLI `control.py news`): status (product `health`
++ install_tasks --status condensed), manual runs via `schtasks /run` on the
+installed internet-discovery-* tasks (never blocks the tick), config
+show/set. Mutations whitelisted: product .env runtime keys (digest_time/
+digest_max/intervals/max_scores, validated; cadence keys auto re-run
+`--install` because triggers are derived at install time) + interests.json
+`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload). Every
+mutated file backed up to product backups/ first; no git ops in the module;
+EC_NEWS_ROOT overrides the product root (tests). tests/test_news.py (14).
+Product deployed same day: PR #9 merged, six tasks installed+verified,
+digest flowing (see owner-repo commit e4485dc for the two live-install
+fixes).
+
 ## Roadmap DAG (roadmap.yaml)
 01,02 parallel roots · 03,04←02 (parallel) · 05←03+04 (fable planner) ·
 06,07←05 (parallel) · 08←01+06+07 (fable) · 09a←01:validated (background
