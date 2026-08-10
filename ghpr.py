@@ -92,9 +92,31 @@ def make_push(ctx):
 
 
 STEP_MARK = {"ACCEPTED": "accepted ✅", "SOAKING": "soaking 🟢"}
+COMMITS_MAX = 100
 
 
-def pr_body(conn, repo: str, baseline: str, tip: str) -> str:
+def _commit_lines(ws: Path | None, baseline: str, tip: str) -> list[str]:
+    """Full per-commit changelog of the branch (subjects from git, newest
+    last). Defensive: no workspace or unreadable range renders no section."""
+    if ws is None:
+        return []
+    out = gitops.git_ro(["log", "--no-merges", "--reverse", "--format=%h %s",
+                         f"{baseline}..{tip}"], cwd=ws, check=False).stdout or ""
+    subjects = [s.strip() for s in out.splitlines() if s.strip()]
+    if not subjects:
+        return []
+    lines = ["", "## Every change in this branch", ""]
+    if len(subjects) > COMMITS_MAX:
+        lines.append(f"_… {len(subjects) - COMMITS_MAX} earlier commits omitted …_")
+        subjects = subjects[-COMMITS_MAX:]
+    for s in subjects:
+        sha, _, subject = s.partition(" ")
+        lines.append(f"- `{sha}` {subject}")
+    return lines
+
+
+def pr_body(conn, repo: str, baseline: str, tip: str, ws: Path | None = None) -> str:
+    docs_tip = db.kv_get(conn, f"docs_tip:{repo}")
     lines = [
         f"Automated integration branch for `{repo}`, maintained by engine-control.",
         "Every commit was cherry-picked here only after worktree tests, an",
@@ -103,8 +125,16 @@ def pr_body(conn, repo: str, baseline: str, tip: str) -> str:
         f"- Baseline (roadmap pin): `{baseline[:12]}`",
         f"- Last validated push: `{tip[:12]}` at {common.now()}",
         "- README + repo description: maintained automatically"
-        + (f" (last refresh covered `{db.kv_get(conn, f'docs_tip:{repo}')[:12]}`)"
-           if db.kv_get(conn, f"docs_tip:{repo}") else " (first refresh pending)"),
+        + (f" (last refresh covered `{docs_tip[:12]}`)" if docs_tip
+           else " (first refresh pending)"),
+        "",
+        "## README updates from this branch",
+        "",
+        db.kv_get(conn, f"docs_summary:{repo}")
+        or "The detailed README refresh for this branch is still in flight; "
+           "this section fills in as soon as it lands.",
+        "",
+        "## Roadmap steps in this branch",
         "",
         "| roadmap step | state | commits | last integrated |",
         "|---|---|---|---|",
@@ -116,6 +146,7 @@ def pr_body(conn, repo: str, baseline: str, tip: str) -> str:
             " GROUP BY c.step_id ORDER BY MIN(c.id)", (repo,)):
         mark = STEP_MARK.get(r["state"], (r["state"] or "").lower() + " 🔄")
         lines.append(f"| {r['step_id']} — {r['title']} | {mark} | {r['n']} | {r['last']} |")
+    lines += _commit_lines(ws, baseline, tip)
     lines += ["", "_Opened automatically by engine-control; the branch is updated only "
               "with validated work. Do not push to it by hand._"]
     return "\n".join(lines)
@@ -234,7 +265,8 @@ def _body_file(ctx, conn, name, rc, tip) -> Path:
     d = ctx.art / "pr"
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
-    common.write_atomic(p, ctx.redact(pr_body(conn, name, rc["baseline"], tip)))
+    common.write_atomic(p, ctx.redact(
+        pr_body(conn, name, rc["baseline"], tip, ws=Path(rc["workspace"]))))
     return p
 
 

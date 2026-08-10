@@ -27,23 +27,33 @@ URL — clones keep DISABLED push remotes; guard unchanged) and keeps one open
 PR per repo (head automation/integration, base `pr_base:`/default; replaced
 after merge when new work lands). Failures notify once per tip + 10m backoff,
 never the error streak; runs while paused; idle cost 2 kv reads. gh CLI =
-auth/API (EC_GH_EXE). Telegram: push/PR-open notifications, `/prs`.
+auth/API (EC_GH_EXE). Telegram: push/PR-open notifications, `/prs`. PR body
+is DETAILED (owner ask 2026-08-10): "README updates from this branch"
+section (kv docs_summary, verbatim worker changelog), steps table, and
+"Every change in this branch" (git log subjects baseline..tip, cap 100,
+workspace passed by _body_file; no ws → section absent).
 
 ## GitHub docs visibility (2026-08-10)
 `ghdocs.py` tick phase (runs before pr_sync; skips itself while paused): when
-kv pr_pushed advances past docs_tip, dispatches ONE background sonnet `docs`
-worker (ROLES entry; ROLE_CLASS build + background=True — never steals a
-slot; 6h cooldown kv docs_next_at, bypassed when README missing at tip) in a
-worktree at the published tip. Acceptance is mechanical: README.md-only diff
+kv pr_pushed advances past docs_tip/docs_applied, dispatches ONE background
+sonnet `docs` worker (ROLES entry; ROLE_CLASS build + background=True —
+never steals a slot; NO cooldown since 2026-08-10 — owner wants the README
+refreshed on EVERY validated push; kv docs_applied marks the refresh's own
+integration commit covered so it never re-triggers on itself) in a worktree
+at the published tip. Acceptance is mechanical: README.md-only diff
 + no secrets, else reject (kv docs_reject — that tip never retried; event +
 notify). Apply: cherry-pick -x onto integration (provenance-grep idempotent,
 defers while repo_integration_busy), advance pr_tip (test-green by
 construction: code identical to validated tip). Repo description: worker
 result `description` → kv gh_desc_want → `gh api PATCH repos/{slug}` (kv
-gh_desc caches; retried via gh_desc_want after backoff). Failures event +
-notify once per tip + 1h backoff; never the error streak. PR body shows docs
+gh_desc caches; retried via gh_desc_want after backoff). Worker result `summary`
+(prompted as a per-section markdown changelog of the README update) → kv
+docs_summary → rendered verbatim in the PR body. Failures event + notify
+once per tip + 1h backoff; never the error streak. PR body shows docs
 freshness line. prompts/docs.md, schemas/docs_result.schema.json,
-tests/test_docs.py (17).
+tests/test_docs.py (19). CI: .github/workflows/tests.yml runs test_infra +
+all unit suites on windows-latest for every PR/push to main (internet + ai
+repos already have their own tests.yml on GitHub).
 
 ## Worker visibility (2026-08-10)
 `/workers` (tg + CLI): every open run with probe phase, elapsed/deadline,
