@@ -110,8 +110,12 @@ def main():
           f"cost=${stdout.get('total_cost_usd', '?')}")
     check("session id matches deterministic identity",
           stdout.get("session_id") == common.session_uuid(key))
-    check("no API billing (subscription reports $0)",
-          not stdout.get("total_cost_usd"))
+    # total_cost_usd in -p output is an API-price ESTIMATE of usage value,
+    # not a bill: billing mode is proven by subscription OAuth auth + the
+    # stripped key env (checked above/below). Record it as information only.
+    print(f"      (informational usage value: ${stdout.get('total_cost_usd', 0)})")
+    check("billing mode is subscription OAuth (no key, no override)",
+          cap.auth_ok(cap.detect(ctx, conn, force=False, trigger="smoke_billing")))
 
     # 4. telemetry after real responses
     cap.ingest_telemetry(ctx, conn)

@@ -36,7 +36,14 @@ oauthAccount fields (organizationRateLimitTier default_claude_max_5x/20x →
 max5/max20; organizationType; freshness=profileFetchedAt) + credentials-file
 mtime. Never parses credentials. Conflicts: fresher exact tier wins
 (probable) else conservative-min (conflict); bounded haiku refresh probe
-(≥10m apart, ≤3/episode, quota-aware) while unresolved/contested. Tiers →
+(≥10m apart, ≤3/episode, quota-aware) while unresolved/contested. Measured
+(smoke, CLI 2.1.226): headless -p sessions refresh NO caches — freshness
+arrives passively (token refresh → family-level subscriptionType; any
+interactive session → profile+usage), stale telemetry degrades to the
+conservative unknown band, and CLI quota hits are the hard backstop. Plan
+transitions therefore propagate: family-level within ~a token refresh,
+exact 5x/20x on next interactive/daemon profile fetch — safe both directions
+(under-parallelize until evidence; overshoot caught by WAITING_QUOTA). Tiers →
 envelopes: max20 4/5 (opus 2), max5+max_unknown 2/3, pro 1/2, unknown 1/1;
 fable cap 1 everywhere. Utilization: cachedUsageUtilization (primary) +
 automation statusline files (`telemetry/sessions/`, atomic, whitelist-only)

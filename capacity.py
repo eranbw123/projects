@@ -322,8 +322,15 @@ def auth_ok(view: dict) -> bool:
 # ------------------------------------------------------------ refresh probe
 
 def maybe_dispatch_probe(ctx, conn, view) -> bool:
-    """Small bounded haiku request to freshen entitlement/usage caches.
-    Only while detection is unresolved; strictly rate limited."""
+    """Small bounded haiku request while detection is unresolved; strictly
+    rate limited. Measured reality (real smoke, CLI 2.1.226): headless -p
+    sessions refresh NEITHER the entitlement profile nor the usage cache, so
+    the probe's guaranteed value is only quota evidence (a limited probe =
+    hard capacity information). Cache freshness arrives passively instead:
+    credentials/token refresh updates the family-level subscriptionType, and
+    any interactive session refreshes profile + usage. Stale telemetry
+    degrades decisions to the conservative 'unknown' band, and CLI-reported
+    quota hits are the hard backstop — the probe is never relied upon."""
     if ctx.getenv("EC_DISABLE_PROBE") == "1":
         return False
     if view.get("confidence") not in ("conflict", "conservative_fallback") \
