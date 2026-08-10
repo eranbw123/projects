@@ -14,6 +14,10 @@ and propose a one-line GitHub repo description.
   capabilities that landed recently (`git log --oneline -30` shows what
   changed), keep the existing structure, tone and level of detail. Do not
   rewrite sections that are still accurate.
+- The README must reflect what the automation branch changed: every
+  user-visible capability, command, or behavior that recent commits added or
+  altered belongs in the appropriate README section. Nothing that landed may
+  be invisible to a reader of the README.
 - A good README here covers: what the project is and does (lead with this),
   setup/quickstart, how to run the tests, and a short map of the main
   components. Concise beats exhaustive.
@@ -39,7 +43,7 @@ Write your machine-readable result JSON to exactly:
 {
  "version": 1,
  "status": "done" | "failed",
- "summary": "<2-4 sentences: what you changed and why, or why nothing needed changing>",
+ "summary": "<DETAILED markdown changelog of your README update — it is published verbatim as the 'README updates' section of the repo's pull request. One bullet per README section you added/changed/removed, each stating WHAT changed in that section and WHICH recent capability or change in the branch prompted it. No vague one-liners. If nothing needed changing, say so and why the README is already accurate.>",
  "description": "<ONE plain-text sentence, max 250 chars: what this repository is/does — becomes the GitHub repo description>"
 }
 

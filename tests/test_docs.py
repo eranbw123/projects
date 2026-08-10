@@ -86,8 +86,6 @@ class TestTrigger(DocsBase):
 
     def test_missing_readme_bootstraps_immediately(self):
         self.seed_pushed()
-        # cooldown active — a missing README must bypass it
-        db.kv_set(self.conn, "docs_next_at:canary", common.iso_in(3600))
         self.sync()
         self.assertEqual(len(self.launches), 1)
         info = self.open_docs_run()
@@ -100,22 +98,19 @@ class TestTrigger(DocsBase):
         self.assertNotIn("<<REPO>>", prompt)
         self.assertTrue(self.events("docs_dispatched"))
 
-    def test_covered_tip_and_cooldown_gate(self):
+    def test_covered_tip_gates_and_every_new_tip_redispatches(self):
         self.seed_pushed()
         db.kv_set(self.conn, "docs_tip:canary", self.tip)
         self.sync()
         self.assertEqual(self.launches, [])  # already covered
 
-        # new tip WITH a README at it → cooldown applies
+        # new tip WITH a README at it → refresh dispatches IMMEDIATELY:
+        # there is no cooldown, every validated push updates the README
         (self.ws / "README.md").write_text("# canary\n")
         git(["add", "-A"], self.ws)
         git(["commit", "-m", "docs: seed"], self.ws)
         tip2 = git(["rev-parse", "HEAD"], self.ws).strip()
         self.seed_pushed(tip2)
-        db.kv_set(self.conn, "docs_next_at:canary", common.iso_in(3600))
-        self.sync()
-        self.assertEqual(self.launches, [])
-        db.kv_set(self.conn, "docs_next_at:canary", common.iso_in(-1))
         self.sync()
         self.assertEqual(len(self.launches), 1)
 
@@ -165,9 +160,12 @@ class TestApply(DocsBase):
         self.assertEqual(db.kv_get(self.conn, "pr_tip:canary"), new_tip)
         show = git(["show", f"{new_tip}:README.md"], self.ws)
         self.assertIn("What it does", show)
-        # bookkeeping: covered tip, cooldown armed, worktree gone, kv closed
+        # bookkeeping: base covered, the applied docs commit marked so its own
+        # publication never re-triggers a refresh, the worker summary kept
+        # for the PR body, worktree gone, kv closed
         self.assertEqual(db.kv_get(self.conn, "docs_tip:canary"), self.tip)
-        self.assertTrue(db.kv_get(self.conn, "docs_next_at:canary"))
+        self.assertEqual(db.kv_get(self.conn, "docs_applied:canary"), new_tip)
+        self.assertEqual(db.kv_get(self.conn, "docs_summary:canary"), "updated")
         self.assertFalse(Path(info["wt"]).exists())
         self.assertIsNone(self.open_docs_run())
         # description PATCHed once and cached
@@ -183,6 +181,19 @@ class TestApply(DocsBase):
         self.sync(gh=gh2)  # nothing left to do: no gh traffic, no dispatch
         self.assertEqual(gh2.calls, [])
         self.assertEqual(len(self.launches), 1)
+
+        # publishing the docs commit itself never re-triggers a refresh…
+        self.seed_pushed(new_tip)
+        self.sync(gh=FakeGh())
+        self.assertEqual(len(self.launches), 1)
+        # …but the NEXT validated tip refreshes immediately (no cooldown)
+        (self.ws / "more.py").write_text("x = 1\n")
+        git(["add", "-A"], self.ws)
+        git(["commit", "-m", "feat: more"], self.ws)
+        tip3 = gitops.current_sha(self.ws, ghdocs.INTEGRATION)
+        self.seed_pushed(tip3)
+        self.sync(gh=FakeGh())
+        self.assertEqual(len(self.launches), 2)
 
     def test_non_readme_change_is_discarded(self):
         self.dispatch()
@@ -293,6 +304,28 @@ class TestPrBodyDocsLine(DocsBase):
         db.kv_set(self.conn, "docs_tip:canary", self.tip)
         body = ghpr.pr_body(self.conn, "canary", self.tip, self.tip)
         self.assertIn(self.tip[:12], body)
+
+    def test_body_carries_detailed_readme_summary(self):
+        body = ghpr.pr_body(self.conn, "canary", self.tip, self.tip)
+        self.assertIn("README updates from this branch", body)
+        self.assertIn("still in flight", body)
+        db.kv_set(self.conn, "docs_summary:canary",
+                  "- **Usage**: documented the new `mul()` API")
+        body = ghpr.pr_body(self.conn, "canary", self.tip, self.tip)
+        self.assertIn("documented the new `mul()` API", body)
+        self.assertNotIn("still in flight", body)
+
+    def test_body_lists_every_commit_in_branch(self):
+        (self.ws / "f.py").write_text("y = 2\n")
+        git(["add", "-A"], self.ws)
+        git(["commit", "-m", "feat: add frobnicator"], self.ws)
+        tip2 = git(["rev-parse", "HEAD"], self.ws).strip()
+        body = ghpr.pr_body(self.conn, "canary", self.tip, tip2, ws=self.ws)
+        self.assertIn("Every change in this branch", body)
+        self.assertIn("feat: add frobnicator", body)
+        # no workspace → the section is simply absent, never an error
+        body = ghpr.pr_body(self.conn, "canary", self.tip, tip2)
+        self.assertNotIn("Every change in this branch", body)
 
 
 if __name__ == "__main__":

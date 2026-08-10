@@ -1,0 +1,32 @@
+# Offline test suites for engine-control. Windows runner on purpose: the
+# controller is Windows-only (Scheduled Tasks, taskkill, cmd /d /c quirks)
+# and one infra test exercises a real one-shot Scheduled Task (it cleans up
+# after itself). Suites are model-free (stub worker) and network-free.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Infra suite
+        working-directory: tests
+        run: python test_infra.py
+
+      - name: Unit suites
+        working-directory: tests
+        run: python -m unittest test_flow test_capacity test_dag test_pr test_docs test_news test_workers test_visibility -v

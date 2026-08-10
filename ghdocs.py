@@ -15,11 +15,15 @@ and proposes a one-line GitHub repo description. The controller then:
 - PATCHes the GitHub repo description via gh api when it changes.
 
 Cost/safety posture: at most one docs worker in flight globally, dispatched
-through capacity.can_dispatch as background work, only while not paused, with
-a per-repo cooldown between refreshes; a rejected tip is never retried (the
-next validated tip triggers a fresh attempt). GitHub/worker failures event +
-notify once and back off — they never pause development and never feed the
-controller error streak.
+through capacity.can_dispatch as background work, only while not paused.
+EVERY newly published validated tip triggers a refresh (no cooldown — the
+owner wants the README always current with the branch); the applied docs
+commit itself is marked covered so a refresh never re-triggers on its own
+README commit. A rejected tip is never retried (the next validated tip
+triggers a fresh attempt). GitHub/worker failures event + notify once and
+back off — they never pause development and never feed the controller error
+streak. The worker's summary is kept (kv docs_summary) and published in the
+PR body as the detailed "what the README update covers" section.
 """
 from __future__ import annotations
 
@@ -36,10 +40,10 @@ import telegram as tgm
 import validators as vd
 
 INTEGRATION = "automation/integration"
-COOLDOWN_SEC = 6 * 3600      # min gap between README refreshes per repo
 BACKOFF_SEC = 3600           # after a worker/gh failure
 ALLOWED_FILES = {"readme.md"}
 DESC_LIMIT = 350             # GitHub caps repo descriptions at 350 chars
+SUMMARY_LIMIT = 4000         # kv docs_summary cap (rendered into the PR body)
 
 
 def docs_sync(ctx, conn, roadmap, gh=None, launch=None) -> None:
@@ -73,24 +77,19 @@ def _sync_repo(ctx, conn, name, rc, gh, launch):
 
 # ------------------------------------------------------------------ dispatch
 
-def _readme_missing(ws: Path, tip: str) -> bool:
-    files = gitops.git_ro(["ls-tree", "--name-only", tip], cwd=ws,
-                          check=False).stdout or ""
-    return not any(f.strip().lower() in ALLOWED_FILES for f in files.splitlines())
-
-
 def _maybe_dispatch(ctx, conn, name, rc, launch):
     tip = db.kv_get(conn, f"pr_pushed:{name}")
+    # docs_applied is the integration commit a refresh itself produced: its
+    # README was written for exactly this code, so publishing it must never
+    # trigger a second refresh of its own update.
     if not tip or tip in (db.kv_get(conn, f"docs_tip:{name}"),
-                          db.kv_get(conn, f"docs_reject:{name}")):
+                          db.kv_get(conn, f"docs_reject:{name}"),
+                          db.kv_get(conn, f"docs_applied:{name}")):
         return
     if ghpr.github_slug(Path(rc["source"])) is None:
         db.kv_set(conn, f"docs_tip:{name}", tip)  # no GitHub: nothing to maintain
         return
     ws = Path(rc["workspace"])
-    nxt = db.kv_get(conn, f"docs_next_at:{name}")
-    if not _readme_missing(ws, tip) and nxt and not common.is_past(nxt):
-        return  # cooldown (a missing README bootstraps immediately)
     if conn.execute("SELECT 1 FROM runs WHERE role='docs' AND status IN "
                     "('PREPARED','DISPATCHED')").fetchone():
         return  # one docs worker in flight globally
@@ -195,6 +194,11 @@ def _process(ctx, conn, name, rc, open_run, gh):
                 return
         new_tip = gitops.current_sha(ws, INTEGRATION)
         db.kv_set(conn, f"pr_tip:{name}", new_tip)
+        db.kv_set(conn, f"docs_applied:{name}", new_tip)
+        summary = (obj.get("summary") or "").strip()
+        if summary:
+            db.kv_set(conn, f"docs_summary:{name}",
+                      ctx.redact(summary)[:SUMMARY_LIMIT])
         db.event(conn, ctx, "docs_applied", repo=name, base=base, tip=new_tip)
         tgm.notify(conn, ctx, f"docs:{name}:{base[:12]}",
                    f"engine-control: 📘 {name} README refreshed — lands in the "
@@ -206,7 +210,6 @@ def _process(ctx, conn, name, rc, open_run, gh):
     if desc:
         db.kv_set(conn, f"gh_desc_want:{name}", ctx.redact(desc)[:DESC_LIMIT])
     db.kv_set(conn, f"docs_tip:{name}", base)
-    db.kv_set(conn, f"docs_next_at:{name}", common.iso_in(COOLDOWN_SEC))
     db.kv_set(conn, f"docs_backoff:{name}", "")
     _close(conn, name, ws, wt)
     _desc_sync(ctx, conn, name, rc, gh)
