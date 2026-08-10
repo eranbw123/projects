@@ -291,6 +291,10 @@ def repair_or_block(ctx, conn, step, findings: str):
     pos = db.ladder_pos(conn, step["id"], task_idx, cycle)
     d["last_findings"] = findings[:6000]
     db.set_detail(conn, step["id"], d)
+    if not d.get("task_wt"):
+        goto_blocked(ctx, conn, step,
+                     "failure before implementation stage: " + findings[:200])
+        return
     if pos >= LADDER_MAX:
         goto_blocked(ctx, conn, step, f"repair budget exhausted ({pos} attempts). Last: {findings[:200]}")
         return
@@ -419,6 +423,29 @@ def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
     repo = plan["tasks"][idx]["repo"] if plan else json.loads(step["repos"])[0]
     rc = repo_cfg(roadmap, repo)
     ws = Path(rc["workspace"])
+    # Replay defense: if this task already has a live or completed implementer
+    # (crash/replay re-entry), adopt it — never dispatch a sibling worker.
+    prior = conn.execute(
+        "SELECT * FROM runs WHERE step_id=? AND cycle=? AND task_idx=? AND "
+        "role='implementer' ORDER BY id DESC LIMIT 1",
+        (step["id"], cycle, idx)).fetchone()
+    if prior and prior["status"] in ("PREPARED", "DISPATCHED", "DONE"):
+        frm = step["state"]
+        with conn:
+            conn.execute("UPDATE steps SET active_run_id=?, state='IMPLEMENTING', "
+                         "updated_at=? WHERE id=?",
+                         (prior["id"], common.now(), step["id"]))
+            if frm != "IMPLEMENTING":
+                conn.execute(
+                    "INSERT INTO transitions(ts,step_id,from_state,to_state,reason)"
+                    " VALUES(?,?,?,?,?)",
+                    (common.now(), step["id"], frm, "IMPLEMENTING",
+                     "replay: adopted existing task worker"))
+        db.event(conn, ctx, "run_readopted", step_id=step["id"],
+                 run_id=prior["id"], key=prior["key"])
+        if prior["status"] == "PREPARED":
+            launch(ctx, conn, prior)
+        return
     branch = f"ec/{step['id']}-c{cycle}-t{idx}"
     wt = ctx.art / "wt" / f"{step['id']}-c{cycle}-t{idx}"
     base = d.get("task_base")
@@ -430,14 +457,16 @@ def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
     if not wt.exists():
         gitops.worktree_add(ws, wt, branch, base)
     plan_json = Path(step["plan_path"]).read_text(encoding="utf-8") if step["plan_path"] else "{}"
+    objective = plan["tasks"][idx]["objective"] if plan else step["title"]
     model, effort = route_model(scfg, "implementer")
     prompt = fill(prompt_template("implementer.md"), {
-        "STEP_ID": step["id"], "OBJECTIVE": task_objective(ctx, step),
+        "STEP_ID": step["id"], "OBJECTIVE": objective,
         "PLAN": plan_json[:12000], "REPO": repo,
         "TESTS": json.dumps(rc["tests"]),
         "RULES": worker_rules(ctx, step), "RESULT_PATH": "<<RESULT_PATH>>"})
     dispatch(ctx, conn, step, "implementer", prompt, wt, "IMPLEMENTING",
-             f"task {idx} implementer dispatched", model=model, effort=effort)
+             f"task {idx} implementer dispatched", task_idx=idx,
+             model=model, effort=effort)
 
 
 def start_testing(ctx, conn, roadmap, step):
@@ -526,8 +555,11 @@ def enter_validation(ctx, conn, roadmap, step):
         if status == "conflict":
             db.event(conn, ctx, "cherry_conflict", step_id=step["id"], sha=sha)
             repair_or_block(ctx, conn, step,
-                            f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}; "
-                            "rebase your branch onto the current integration tip and resolve")
+                            f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}: "
+                            "integration advanced under this task. Re-apply the change as new "
+                            "commits that apply cleanly on the current integration content; if "
+                            "that is impossible from this worktree, report status failed "
+                            "(the owner can /retry to re-plan from the new tip)")
             return
         if status == "ok":
             record(sha, new_sha)
@@ -969,10 +1001,14 @@ def tick(ctx) -> int:
             # A controller bug must be loud, bounded, and never a silent loop.
             streak = int(db.kv_get(conn, "orch_err_streak", "0")) + 1
             db.kv_set(conn, "orch_err_streak", str(streak))
+            if streak == 1:
+                episode = int(db.kv_get(conn, "orch_err_episode", "0")) + 1
+                db.kv_set(conn, "orch_err_episode", str(episode))
+            episode = db.kv_get(conn, "orch_err_episode", "0")
             ctx.log(f"orchestration error x{streak}: {e!r}")
             db.event(conn, ctx, "advance_error", err=repr(e)[:400], streak=streak)
             if streak in (1, 5):
-                tgm.notify(conn, ctx, f"orch-error:{streak}",
+                tgm.notify(conn, ctx, f"orch-error:{episode}:{streak}",
                            f"engine-control: orchestration error x{streak}: {e!r:.200}")
             if streak >= 5:
                 step = active_step(conn)

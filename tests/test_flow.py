@@ -355,6 +355,14 @@ class TestMultiTask(FlowBase):
                 "SELECT COUNT(*) c FROM commits WHERE task_idx=? AND integrated_sha "
                 "IS NOT NULL", (idx,)).fetchone()["c"]
             self.assertGreaterEqual(n, 1, f"task {idx} not integrated")
+        # each task must run under its OWN identity/objective, with no phantom
+        # repair compensating for a misdispatched implementer (audit regression)
+        repairs = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='repair'"
+                               ).fetchone()["c"]
+        self.assertEqual(repairs, 0, "phantom repair in multi-task happy path")
+        keys = [r["key"] for r in conn.execute(
+            "SELECT key FROM runs WHERE role='implementer' ORDER BY id")]
+        self.assertEqual(keys, ["c1.c0.t0.implementer.1", "c1.c0.t1.implementer.1"])
         conn.close()
         app = (Path(self.sb.ws) / "app.py").read_text()
         self.assertIn("def mul", app)

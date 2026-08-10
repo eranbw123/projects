@@ -234,17 +234,23 @@ def spawn(ctx: common.Ctx, key: str, lane: str) -> dict:
 
 
 def pid_alive(pid: int) -> bool:
-    """True only if the pid exists AND is a python image (the shim is always
-    python). Guards probe/kill against PID reuse after reboot — a reused pid
-    of another program must never be treated as ours, let alone taskkilled."""
+    """True only if the pid exists, is a python image, AND its command line
+    names worker_shim.py. Guards probe/kill against PID reuse — a reused pid
+    (even another python process such as the owner's long-running scripts)
+    must never be treated as ours, let alone taskkilled."""
     p = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                        capture_output=True, text=True)
     line = (p.stdout or "").strip()
     if not line.startswith('"'):
         return False
-    cols = line.split('","')
-    image = cols[0].strip('"').lower()
-    return image.startswith("python") and str(pid) in line
+    image = line.split('","')[0].strip('"').lower()
+    if not image.startswith("python") or str(pid) not in line:
+        return False
+    q = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+        capture_output=True, text=True)
+    return "worker_shim.py" in (q.stdout or "").lower()
 
 
 def task_status(tn: str) -> str | None:
