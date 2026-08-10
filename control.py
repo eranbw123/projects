@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import traceback
 from pathlib import Path
 
 import capacity as cap
@@ -405,7 +407,8 @@ def wait_quota(ctx, conn, step):
 def goto_blocked(ctx, conn, step, reason):
     db.transition(conn, ctx, step["id"], "BLOCKED", reason)
     tgm.notify(conn, ctx, f"blocked:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step['id']} BLOCKED — {reason[:300]}\nUse /retry or /abort.")
+               f"engine-control: {step['id']} BLOCKED — {reason[:400]}\n"
+               f"Full history: /why {step['id']} · then /retry or /abort.")
 
 
 def repair_or_block(ctx, conn, step, findings: str):
@@ -447,8 +450,11 @@ def dispatch_repair(ctx, conn, step, findings, pos):
         "STEP_ID": step["id"], "OBJECTIVE": task_objective(ctx, step),
         "FINDINGS": findings, "RESULT_PATH": "<<RESULT_PATH>>",
         "RULES": worker_rules(ctx, step)})
+    # The rung transition carries WHAT is being repaired: "repair rung 2"
+    # alone forced a trip into artifact dirs to learn why (owner finding).
+    why = " — " + (findings or "").strip().splitlines()[0][:160] if findings else ""
     run = dispatch(ctx, conn, step, "repair", prompt, d["task_wt"],
-                   "REPAIRING", f"repair rung {pos + 1}",
+                   "REPAIRING", f"repair rung {pos + 1}{why}",
                    model=model, effort=effort, resume_session=resume_session)
     tgm.notify(conn, ctx, f"repair:{run['key']}",
                f"engine-control: {step['id']} repair started (rung {pos + 1}/{LADDER_MAX})")
@@ -971,13 +977,21 @@ def advance_all(ctx, conn, roadmap):
     ctx.gov = gov
     notify_plan_transition(ctx, conn, view)
 
-    # 1) advance in-flight steps, finishing work first, critical path first
+    # 1) advance in-flight steps, finishing work first, critical path first.
+    # Each step advances inside its own error boundary: a controller bug in
+    # ONE step's path must never stall every other step (the 2026-08-10
+    # stdout=None crash froze the whole roadmap for 6 ticks and the global
+    # streak paused dispatch — with the blast radius actually one step wide).
     active = [s for s in live
               if s["state"] != "PENDING" and s["state"] not in common.HALT_STATES]
     active.sort(key=lambda s: (STAGE_ORDER.get(s["state"], 8),
                                -weights.get(s["id"], 0), s["ordinal"]))
     for s in active:
-        advance_step(ctx, conn, roadmap, db.get_step(conn, s["id"]))
+        try:
+            advance_step(ctx, conn, roadmap, db.get_step(conn, s["id"]))
+            clear_step_advance_error(conn, s["id"])
+        except Exception as e:  # noqa: BLE001 — contained per step, loud below
+            step_advance_error(ctx, conn, s["id"], e)
 
     # 2) start new READY steps up to the dynamic concurrency target
     ready.sort(key=lambda s: (1 if s["background"] else 0,
@@ -996,6 +1010,43 @@ def advance_all(ctx, conn, roadmap):
             start_audit(ctx, conn, roadmap, step, new_step=True)
         else:
             start_planning(ctx, conn, roadmap, step, new_step=True)
+
+
+STEP_ERR_BLOCK_AT = 8   # ticks of repeated per-step controller error -> BLOCKED
+
+
+def step_advance_error(ctx, conn, step_id, exc):
+    """A controller bug advancing ONE step: record it with the step id and
+    traceback (the August stall was undiagnosable from `advance_error` events
+    that carried neither), notify early, and after STEP_ERR_BLOCK_AT ticks
+    block just this step — its dependents stop, everything else keeps moving."""
+    tb = traceback.format_exc()
+    step = db.get_step(conn, step_id)
+    d = db.step_detail(step)
+    streak = d.get("advance_err_streak", 0) + 1
+    d["advance_err_streak"] = streak
+    db.set_detail(conn, step_id, d)
+    ctx.log(f"advance error {step_id} x{streak}: {exc!r}\n" + common.tail(tb, 15))
+    db.event(conn, ctx, "advance_error", step_id=step_id,
+             err=repr(exc)[:300], streak=streak, tb=common.tail(tb, 10)[:1200])
+    if streak in (1, 5):
+        tgm.notify(conn, ctx, f"step-err:{step_id}:{streak}",
+                   f"engine-control: ⚠ controller error advancing {step_id} "
+                   f"x{streak}: {exc!r:.160} — other steps unaffected; "
+                   f"blocks this step at x{STEP_ERR_BLOCK_AT}. /why {step_id}")
+    if streak >= STEP_ERR_BLOCK_AT and step["state"] not in common.HALT_STATES:
+        goto_blocked(ctx, conn, step,
+                     f"controller error advancing this step x{streak}: "
+                     f"{exc!r:.200} — fix the controller, then /retry. "
+                     + common.tail(tb, 3))
+
+
+def clear_step_advance_error(conn, step_id):
+    step = db.get_step(conn, step_id)  # refetch: advance just rewrote detail
+    d = db.step_detail(step)
+    if "advance_err_streak" in d:
+        d.pop("advance_err_streak", None)
+        db.set_detail(conn, step_id, d)
 
 
 def advance_step(ctx, conn, roadmap, step):
@@ -1173,14 +1224,37 @@ def on_testing(ctx, conn, roadmap, step, run):
     if not obj:
         repair_or_block(ctx, conn, step, "test run produced no result artifact")
         return
+    report = common.tail(obj.get("report"), 60)
     if obj.get("passed"):
         tgm.notify(conn, ctx, f"tests:{run['key']}",
                    f"engine-control: {step['id']} tests green — review")
         start_review(ctx, conn, roadmap, step)
+    elif obj.get("no_tests"):
+        # Exit code 5 = the runner COLLECTED NOTHING. That is a roadmap.yaml
+        # test-command vs repo-layout mismatch, not broken code; repair
+        # workers cannot reach engine config, so spending rungs is pure waste
+        # (step-02 burned its whole budget on exactly this).
+        db.set_run_note(conn, ctx, run["id"], "no tests collected (exit 5)")
+        cmds = repo_cfg(roadmap, current_repo(ctx, step))["tests"]
+        goto_blocked(ctx, conn, step,
+                     "test harness collected NO TESTS (exit code 5) — the "
+                     f"roadmap.yaml test command(s) {json.dumps(cmds)} match "
+                     "nothing in the worktree. Fix the command or the layout; "
+                     "repair workers cannot fix engine config.\n" + report)
     else:
+        db.set_run_note(conn, ctx, run["id"],
+                        "tests failed: " + _fail_lines(report, 3))
         tgm.notify(conn, ctx, f"tests:{run['key']}",
                    f"engine-control: {step['id']} tests FAILED — repair path")
-        repair_or_block(ctx, conn, step, "tests failed:\n" + common.tail(obj.get("report", ""), 60))
+        repair_or_block(ctx, conn, step, "tests failed:\n" + report)
+
+
+def _fail_lines(report: str, n: int) -> str:
+    """First n lines that look like actual failures — the part of a test
+    report a human wants first."""
+    hits = [l.strip() for l in (report or "").splitlines()
+            if re.search(r"FAIL|ERROR|Error|error:|failed|rc=[1-9]", l)]
+    return " | ".join(hits[:n]) or (report or "").strip()[:200]
 
 
 def on_review(ctx, conn, roadmap, step, run):
@@ -1280,6 +1354,13 @@ def status_text(ctx, conn) -> str:
         pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
         mark = {"ACCEPTED": "✅", "BLOCKED": "⛔", "ABORTED": "🛑"}.get(s["state"], "·")
         lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos} — {s['title']}")
+        if s["state"] == "BLOCKED":
+            why = conn.execute(
+                "SELECT reason FROM transitions WHERE step_id=? AND to_state='BLOCKED' "
+                "ORDER BY id DESC LIMIT 1", (s["id"],)).fetchone()
+            if why and why["reason"]:
+                first = why["reason"].strip().splitlines()[0]
+                lines.append(f"   ⛔ {first[:150]}  (/why {s['id']})")
         if s["active_run_id"]:
             r = db.get_run(conn, s["active_run_id"])
             if r and r["status"] in ("PREPARED", "DISPATCHED"):
@@ -1288,6 +1369,77 @@ def status_text(ctx, conn) -> str:
     if not tgm.from_ctx(ctx):
         lines.append("⚠ telegram: WAITING_CONFIG (see README)")
     return "\n".join(lines)
+
+
+def _run_outcome(conn, run) -> str:
+    """One line saying what a run actually did — derived from its result
+    artifact so it works for runs recorded before notes existed."""
+    if run["status"] in ("FAILED", "QUOTA", "LOST"):
+        return f"{run['status']}: {(run['note'] or '').strip()[:160]}"
+    obj = common.read_json(Path(run["artifact_dir"]) / "result.json") or {}
+    role = run["role"]
+    if role == "test":
+        if obj.get("passed"):
+            return "tests green"
+        if obj.get("no_tests"):
+            return "NO TESTS COLLECTED (exit 5) — command/layout mismatch"
+        if obj:
+            return "tests failed: " + _fail_lines(obj.get("report") or "", 2)[:200]
+        return run["note"] or "no result artifact"
+    if role in ("implementer", "repair"):
+        if obj.get("status") == "done":
+            return "done: " + (obj.get("summary") or "")[:160]
+        return f"reported {obj.get('status', '?')}: {(obj.get('summary') or '')[:160]}"
+    if role in ("reviewer", "diagnostic", "audit"):
+        v = obj.get("verdict") or obj.get("status") or "?"
+        n = len(obj.get("findings") or [])
+        return f"{v}, {n} finding(s)" if obj else (run["note"] or "no artifact")
+    if role == "planner":
+        return f"plan with {len(obj.get('tasks', []))} task(s)" if obj else "no plan artifact"
+    return (run["note"] or obj.get("summary") or "").strip()[:160] or run["status"]
+
+
+def why_text(ctx, conn, step_id=None) -> str:
+    """The failure story of a step: full last-block reason, then every run of
+    the relevant cycle with its outcome. Everything /status truncates lives
+    here untruncated (within Telegram's message budget)."""
+    step = db.get_step(conn, step_id) if step_id else None
+    if step_id and not step:
+        return f"engine-control: unknown step '{step_id}'"
+    if not step:  # default: most recently halted, else most recently updated
+        row = conn.execute(
+            "SELECT * FROM steps WHERE state IN ('BLOCKED','ABORTED') "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone() or conn.execute(
+            "SELECT * FROM steps WHERE state NOT IN ('PENDING','ACCEPTED') "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if not row:
+            return "engine-control: nothing in flight and nothing halted"
+        step = row
+    d = db.step_detail(step)
+    cycle = d.get("cycle", 0)
+    lines = [f"why {step['id']} — [{step['state']}] cycle {cycle} — {step['title']}"]
+    for t in conn.execute(
+            "SELECT * FROM transitions WHERE step_id=? ORDER BY id DESC LIMIT 3",
+            (step["id"],)).fetchall()[::-1]:
+        reason = (t["reason"] or "").strip().replace("\n", " ¶ ")
+        lines.append(f"{common.local_str(t['ts'], '%H:%M')} {t['from_state']}"
+                     f"→{t['to_state']}: {reason[:400]}")
+    runs = conn.execute(
+        "SELECT * FROM runs WHERE step_id=? AND cycle=? AND role!='probe' "
+        "ORDER BY id", (step["id"], cycle)).fetchall()
+    if not runs and cycle > 0:  # fresh /retry cycle with nothing yet: show previous
+        cycle -= 1
+        lines.append(f"(cycle {cycle + 1} has no runs yet; showing cycle {cycle})")
+        runs = conn.execute(
+            "SELECT * FROM runs WHERE step_id=? AND cycle=? AND role!='probe' "
+            "ORDER BY id", (step["id"], cycle)).fetchall()
+    for r in runs:
+        who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+        lines.append(f"· {common.local_str(r['created_at'], '%H:%M')} "
+                     f"{who} [{r['status']}] {_run_outcome(conn, r)}")
+    if runs:
+        lines.append(f"artifacts: {runs[-1]['artifact_dir']}")
+    return "\n".join(lines)[:3900]  # telegram hard limit 4096
 
 
 def rearm_step(ctx, conn, step) -> str:
@@ -1361,10 +1513,12 @@ def handle_commands(ctx, conn, tg, cmds):
                 tg.send(f"engine-control: pace {arg}")
             else:
                 tg.send("engine-control: /pace auto|economy|balanced|sprint")
+        elif name == "/why":
+            tg.send(why_text(ctx, conn, arg))
         elif name == "/log":
             rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
             out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {r['kind']} "
-                            f"{r['step_id'] or ''} {(r['payload'] or '')[:80]}"
+                            f"{r['step_id'] or ''} {(r['payload'] or '')[:160]}"
                             for r in rows[::-1])
             tg.send(out or "no events")
 
@@ -1676,10 +1830,12 @@ def main(argv=None):
     except (AttributeError, OSError):
         pass
     ap = argparse.ArgumentParser(prog="control.py")
-    ap.add_argument("cmd", choices=["tick", "start", "status", "pause", "resume",
-                                    "retry", "abort", "log", "init", "doctor",
-                                    "install-task", "uninstall-task",
+    ap.add_argument("cmd", choices=["tick", "start", "status", "why", "pause",
+                                    "resume", "retry", "abort", "log", "init",
+                                    "doctor", "install-task", "uninstall-task",
                                     "telegram-detect-chat"])
+    ap.add_argument("target", nargs="?", default=None,
+                    help="step id for `why` (default: last halted step)")
     ap.add_argument("--root", default=None)
     args = ap.parse_args(argv)
     ctx = make_ctx(args.root)
@@ -1700,6 +1856,8 @@ def main(argv=None):
     conn = db.connect(ctx)
     if args.cmd == "status":
         print(status_text(ctx, conn))
+    elif args.cmd == "why":
+        print(why_text(ctx, conn, args.target))
     elif args.cmd == "pause":
         db.kv_set(conn, "paused", "1"); print("paused")
     elif args.cmd == "resume":
@@ -1715,7 +1873,7 @@ def main(argv=None):
     elif args.cmd == "log":
         for r in conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 30").fetchall()[::-1]:
             print(f"{common.local_str(r['ts'], '%Y-%m-%d %H:%M:%S')} "
-                  f"{r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:100]}")
+                  f"{r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:220]}")
     elif args.cmd == "telegram-detect-chat":
         tok = ctx.getenv("DEV_TELEGRAM_BOT_TOKEN")
         if not tok:

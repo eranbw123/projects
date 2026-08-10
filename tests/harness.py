@@ -105,7 +105,8 @@ steps:
 
 class Sandbox:
     def __init__(self, script=None, telegram_ok=True, extra_env="",
-                 steps_yaml=None, repos=("canary",), capacity=None):
+                 steps_yaml=None, repos=("canary",), capacity=None,
+                 tests_cmds=("python test_canary.py",)):
         self.dir = mkroot()
         self.root = self.dir / "ec"
         self.root.mkdir()
@@ -126,9 +127,10 @@ class Sandbox:
             baseline = git(["rev-parse", "HEAD"], src).strip()
             ws = self.dir / "aw" / name
             self.repos[name] = dict(src=src, ws=ws, baseline=baseline)
+            tests_yaml = "\n".join(f"      - {c}" for c in tests_cmds)
             repo_blocks.append(
                 f"  {name}:\n    source: '{src}'\n    workspace: '{ws}'\n"
-                f"    baseline: {baseline}\n    tests:\n      - python test_canary.py")
+                f"    baseline: {baseline}\n    tests:\n{tests_yaml}")
         self.src = self.repos[repos[0]]["src"]
         self.ws = self.repos[repos[0]]["ws"]
 

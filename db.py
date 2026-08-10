@@ -152,12 +152,23 @@ def open_runs(conn):
         "SELECT * FROM runs WHERE status IN ('PREPARED','DISPATCHED') ORDER BY id").fetchall()
 
 
+def set_run_note(conn, ctx, run_id, note: str):
+    """Post-hoc annotation of a finished run with its outcome classification
+    (e.g. 'tests failed: 3 failures' / 'no tests collected'). Keeps the runs
+    table self-explanatory for `why` without re-reading result artifacts."""
+    with conn:
+        conn.execute("UPDATE runs SET note=? WHERE id=?",
+                     (ctx.redact(note)[:500], run_id))
+
+
 def finish_run(conn, ctx, run_id, status, exit_code=None, note=""):
     with conn:
         conn.execute(
             "UPDATE runs SET status=?, ended_at=?, exit_code=?, note=? WHERE id=?",
             (status, common.now(), exit_code, ctx.redact(note)[:500], run_id))
-    event(conn, ctx, "run_" + status.lower(), run_id=run_id, note=note)
+    run = get_run(conn, run_id)
+    event(conn, ctx, "run_" + status.lower(), step_id=run["step_id"],
+          run_id=run_id, key=run["key"], note=note)
 
 
 def ladder_pos(conn, step_id, task_idx, cycle) -> int:

@@ -46,17 +46,25 @@ def run_cmd(cmd: str, cwd, timeout=1800) -> tuple[int, str]:
         return 124, f"[timeout after {timeout}s] {cmd}"
 
 
-def repo_tests(commands: list[str], cwd) -> tuple[bool, str]:
+def repo_tests(commands: list[str], cwd) -> tuple[bool, str, bool]:
     """Run the canonical test commands for a repo (from roadmap.yaml).
-    Never replaces repo test frameworks — just invokes them."""
+    Never replaces repo test frameworks — just invokes them.
+
+    Returns (ok, report, no_tests). no_tests means every failure was exit
+    code 5 — unittest's and pytest's NO TESTS COLLECTED. That is a harness/
+    config mismatch (test command vs repo layout), not failing code: repair
+    workers can't fix roadmap.yaml from inside a worktree, so the controller
+    must not spend repair rungs on it."""
     reports = []
-    ok = True
+    rcs = []
     for cmd in commands:
         rc, out = run_cmd(cmd, cwd)
-        reports.append(f"$ {cmd}\n[rc={rc}]\n{common.tail(out, 80)}")
-        if rc != 0:
-            ok = False
-    return ok, "\n\n".join(reports)
+        rcs.append(rc)
+        note = "  (exit 5 = NO TESTS COLLECTED)" if rc == 5 else ""
+        reports.append(f"$ {cmd}\n[rc={rc}]{note}\n{common.tail(out, 80)}")
+    ok = all(rc == 0 for rc in rcs)
+    no_tests = not ok and all(rc in (0, 5) for rc in rcs)
+    return ok, "\n\n".join(reports), no_tests
 
 
 def check_result(path: Path, schema_name: str) -> tuple[dict | None, list[str]]:
@@ -120,9 +128,10 @@ def main():
     args = ap.parse_args()
     if not args.run_tests:
         ap.error("only --run-tests mode is supported")
-    ok, report = repo_tests(args.cmds, args.cwd)
+    ok, report, no_tests = repo_tests(args.cmds, args.cwd)
     common.write_atomic(Path(args.result), json.dumps(
-        {"version": 1, "passed": ok, "report": report[-20000:]}, indent=1))
+        {"version": 1, "passed": ok, "no_tests": no_tests,
+         "report": report[-20000:]}, indent=1))
     return 0
 
 
