@@ -63,6 +63,12 @@ BLOCKED steps), `/abort [step-id]` (abort one step; its dependents never
 start; independent branches continue), `/profile auto|max5|max20|pro`
 (capacity override — debug only), `/pace auto|economy|balanced|sprint`.
 
+Commands answer within a few seconds: a long-poll listener
+(`tg_listener.py`, supervised by the `engine-control-listener` task) wakes
+the controller the moment an update arrives. If the listener dies, its
+heartbeat goes stale and commands transparently fall back to the 1-minute
+tick cadence until the supervisor restarts it (≤5 min).
+
 ## Telegram setup (required before the roadmap runs)
 
 The controller uses its OWN bot — never the product discovery bot.

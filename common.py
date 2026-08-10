@@ -119,11 +119,11 @@ class Ctx:
             pass
 
 
-def acquire_lock(root: Path):
+def acquire_lock(root: Path, name: str = "tick.lock"):
     """Single-instance lock. OS releases the byte lock when the process dies,
-    so a crashed tick can never wedge the controller."""
+    so a crashed holder can never wedge its successor."""
     import msvcrt
-    f = open(root / "tick.lock", "a+b")
+    f = open(root / name, "a+b")
     try:
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)

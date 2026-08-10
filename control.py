@@ -1371,6 +1371,26 @@ def handle_commands(ctx, conn, tg, cmds):
 
 # ---------- tick ----------
 
+def should_consume_tg(ctx) -> bool:
+    """While the low-latency listener is alive (fresh heartbeat) the tick
+    leaves getUpdates to it — two concurrent pollers 409 each other. A tick
+    woken BY the listener (EC_CONSUME_TG=1) always consumes; a stale
+    heartbeat (listener dead/hung) restores 1-minute fallback consumption."""
+    if os.environ.get("EC_CONSUME_TG") == "1":
+        return True
+    hb = ctx.root / "listener.alive"
+    try:
+        age = (datetime_now_ts() - hb.stat().st_mtime)
+    except OSError:
+        return True
+    return age > 90
+
+
+def datetime_now_ts() -> float:
+    import time as _t
+    return _t.time()
+
+
 def tick(ctx) -> int:
     lock = common.acquire_lock(ctx.root)
     if lock is None:
@@ -1396,8 +1416,9 @@ def tick(ctx) -> int:
         else:
             db.kv_set(conn, "warned_no_tg", "0")
             try:
-                cmds = tgm.consume(ctx, conn, tg)
-                handle_commands(ctx, conn, tg, cmds)
+                if should_consume_tg(ctx):
+                    cmds = tgm.consume(ctx, conn, tg)
+                    handle_commands(ctx, conn, tg, cmds)
             except Exception as e:
                 # a command-handler bug must never cost the tick its
                 # reconcile/advance work (commissioning review finding)
@@ -1463,6 +1484,25 @@ def backup_state(ctx, conn):
 # ---------- CLI ----------
 
 TICK_TASK = "engine-control-tick"
+LISTENER_TASK = "engine-control-listener"
+
+
+def ensure_listener_task(ctx) -> None:
+    """Supervisor for the low-latency Telegram listener: fires every 5
+    minutes; the listener's byte lock makes redundant fires exit instantly,
+    so this is restart-on-crash, not duplication."""
+    import subprocess
+    cmd = f'"{sys.executable}" "{common.CODE_DIR / "tg_listener.py"}"'
+    q = subprocess.run(["schtasks", "/query", "/tn", LISTENER_TASK, "/fo", "csv", "/nh"],
+                       capture_output=True, text=True)
+    if q.returncode != 0:
+        subprocess.run(["schtasks", "/create", "/tn", LISTENER_TASK, "/sc", "minute",
+                        "/mo", "5", "/f", "/tr", cmd], capture_output=True, text=True)
+    elif "Disabled" in q.stdout:
+        subprocess.run(["schtasks", "/change", "/tn", LISTENER_TASK, "/enable"],
+                       capture_output=True, text=True)
+    subprocess.run(["schtasks", "/run", "/tn", LISTENER_TASK],
+                   capture_output=True, text=True)
 
 
 def cmd_start(ctx) -> int:
@@ -1491,6 +1531,7 @@ def cmd_start(ctx) -> int:
         subprocess.run(["schtasks", "/change", "/tn", TICK_TASK, "/enable"],
                        capture_output=True, text=True)
         print("tick task re-enabled")
+    ensure_listener_task(ctx)
     if db.kv_get(conn, "roadmap_started") == "1":
         print(f"roadmap already started (run {db.kv_get(conn, 'roadmap_run_id')}); "
               "no duplicate run created")
@@ -1533,6 +1574,8 @@ def cmd_install_task(ctx):
     p = subprocess.run(["schtasks", "/create", "/tn", TICK_TASK, "/sc", "minute",
                         "/mo", "1", "/f", "/tr", cmd], capture_output=True, text=True)
     print(p.stdout.strip() or p.stderr.strip())
+    ensure_listener_task(ctx)
+    print(f"listener task ensured ({LISTENER_TASK})")
     q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK], capture_output=True, text=True)
     print(q.stdout.strip()[:400])
     return p.returncode
@@ -1543,6 +1586,11 @@ def cmd_uninstall_task(ctx):
     p = subprocess.run(["schtasks", "/delete", "/tn", TICK_TASK, "/f"],
                        capture_output=True, text=True)
     print(p.stdout.strip() or p.stderr.strip())
+    subprocess.run(["schtasks", "/end", "/tn", LISTENER_TASK],
+                   capture_output=True, text=True)
+    q = subprocess.run(["schtasks", "/delete", "/tn", LISTENER_TASK, "/f"],
+                       capture_output=True, text=True)
+    print(q.stdout.strip() or q.stderr.strip())
     return p.returncode
 
 
@@ -1596,6 +1644,15 @@ def cmd_doctor(ctx):
     q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK], capture_output=True, text=True)
     print("[ok] tick task installed" if q.returncode == 0
           else "[..] tick task not installed (python control.py install-task)")
+    hb = ctx.root / "listener.alive"
+    try:
+        import time as _t
+        fresh = (_t.time() - hb.stat().st_mtime) < 90
+    except OSError:
+        fresh = False
+    print("[ok] telegram listener alive (commands answer in seconds)" if fresh
+          else "[..] telegram listener not running (commands at 1-minute tick "
+               "cadence; python control.py install-task starts it)")
     try:
         roadmap = load_roadmap(ctx)
         print(f"[ok] roadmap: {len(roadmap['steps'])} steps, repos: {list(roadmap['repos'])}")

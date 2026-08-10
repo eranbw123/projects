@@ -10,8 +10,15 @@ utilization telemetry, envelopes, governor) · `db.py` (SQLite WAL; + steps
 depends_on/background/audit cols, telemetry, plan_detections) ·
 `claude_runner.py` (job contract, direct/task lanes, probe/adopt/kill, quota
 + fable guards, automation settings) · `telemetry_capture.py` (statusline →
-per-session JSON) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
-`validators.py`.
+per-session JSON) · `tg_listener.py` (long-poll command latency: wakes the
+tick with EC_CONSUME_TG=1; heartbeat `listener.alive` <90s makes the tick
+skip its own getUpdates — no 409s; stale heartbeat = automatic 1-min
+fallback; supervised by Scheduled Task `engine-control-listener` q5min +
+byte lock) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
+`validators.py`. Probe pacing is signature-INDEPENDENT (kv probe_last_at +
+24/day cap): every -p session rewrites .claude.json, so sig-keyed pacing
+self-reset into a probe-per-tick loop (observed live, fixed). Contested-but-
+operational detection probes hourly; unresolved every 10m.
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied

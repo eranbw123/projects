@@ -280,6 +280,17 @@ class TestPlanDetection(Base):
         probes = self.conn.execute(
             "SELECT COUNT(*) c FROM runs WHERE role='probe'").fetchone()["c"]
         self.assertEqual(probes, 1, "probe must be rate-limited/single-flight")
+        # evidence-file churn (every -p session rewrites .claude.json) must
+        # NOT reset the pacing: mark the open probe done, change the sig,
+        # re-detect — still no second probe inside the interval
+        with self.conn:
+            self.conn.execute("UPDATE runs SET status='DONE' WHERE role='probe'")
+        time.sleep(0.02)
+        self.sb.set_capacity(tier="none")   # new mtime -> new sig
+        cap.detect(ctx, self.conn, force=True, trigger="test")
+        probes = self.conn.execute(
+            "SELECT COUNT(*) c FROM runs WHERE role='probe'").fetchone()["c"]
+        self.assertEqual(probes, 1, "sig churn restarted the probe pacing")
 
 
 class TestTelemetry(Base):
