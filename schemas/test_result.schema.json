@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["version", "passed", "report"],
+  "properties": {
+    "version": {"type": "integer"},
+    "passed": {"type": "boolean"},
+    "report": {"type": "string"}
+  }
+}

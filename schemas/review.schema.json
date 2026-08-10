@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "required": ["version", "verdict", "findings"],
+  "properties": {
+    "version": {"type": "integer"},
+    "verdict": {"type": "string", "enum": ["PASS", "REPAIR", "BLOCK"]},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "issue"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["critical", "major", "minor", "info"]},
+          "issue": {"type": "string"},
+          "file": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "string"}
+  }
+}

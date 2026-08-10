@@ -1,0 +1,9 @@
+.env
+state.db
+state.db-wal
+state.db-shm
+artifacts/
+logs/
+tick.lock
+__pycache__/
+*.pyc
