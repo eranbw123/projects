@@ -181,6 +181,27 @@ class TestInfra(unittest.TestCase):
         self.assertTrue(cr.quota_hit("429 too many requests"))
         self.assertFalse(cr.quota_hit("SyntaxError: invalid syntax"))
 
+    def test_cmd_shim_wrapped_against_autorun(self):
+        """claude.CMD workers must run under cmd /d /c or this machine's
+        AutoRun hook moves them into the owner's repos."""
+        import os
+        ctx = self.sb.ctx()
+        ctx.env.pop("EC_WORKER_CMD", None)
+        old = os.environ.pop("EC_WORKER_CMD", None)
+        ctx.env["EC_CLAUDE_EXE"] = "claude"
+        try:
+            if cr.resolve_claude(ctx) is None:
+                self.skipTest("claude CLI not installed")
+            rd = cr.build_job(ctx, "c1.c0.t0.probe.99", "reviewer",
+                              "test <<RESULT_PATH>>", str(self.sb.ws), "opus", "high")
+            argv = json.loads((rd / "job.json").read_text())["argv"]
+            if argv[0].lower().endswith((".cmd", ".bat")) or \
+               (len(argv) > 3 and argv[3].lower().endswith((".cmd", ".bat"))):
+                self.assertEqual(argv[:3], ["cmd", "/d", "/c"], argv)
+        finally:
+            if old:
+                os.environ["EC_WORKER_CMD"] = old
+
     def test_fable_privacy_guard(self):
         self.assertFalse(cr.fable_payload_ok("please analyze conversations.db rows"))
         self.assertFalse(cr.fable_payload_ok("SELECT * FROM raw_conversations"))

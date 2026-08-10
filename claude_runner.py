@@ -131,7 +131,11 @@ def build_job(ctx: common.Ctx, key: str, role: str, prompt_text: str, cwd: str,
                 raise RuntimeError("claude CLI not found on PATH (set EC_CLAUDE_EXE)")
             if model == "fable" and not fable_payload_ok(prompt_text):
                 raise RuntimeError("fable privacy boundary: raw conversation data in prompt")
-            argv = [claude, "-p", "--output-format", "json",
+            # npm installs claude as a .CMD shim; batch files start cmd.exe,
+            # and this machine's cmd AutoRun hijacks the working directory
+            # (worker would run in the owner's repos!). /d disables AutoRun.
+            prefix = ["cmd", "/d", "/c"] if claude.lower().endswith((".cmd", ".bat")) else []
+            argv = [*prefix, claude, "-p", "--output-format", "json",
                     "--model", MODEL_IDS.get(model, model),
                     "--session-id", common.session_uuid(key),
                     "--add-dir", str(rd)]
