@@ -19,6 +19,11 @@ TEST_BOTH = (
     "    def test_mul(self):\n        self.assertEqual(mul(2, 3), 6)\n\n\n"
     "if __name__ == '__main__':\n    unittest.main()\n")
 APP_V3 = APP_OK + "\n\ndef sub(a, b):\n    return a - b\n"
+TEST_ADD_ONLY = (
+    "import unittest\n\nfrom app import add\n\n\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n\n"
+    "if __name__ == '__main__':\n    unittest.main()\n")
 TEST_V3 = (
     "import unittest\n\nfrom app import add, mul, sub\n\n\n"
     "class T(unittest.TestCase):\n"
@@ -96,6 +101,16 @@ def main():
             "rollback_conditions": ["tests red at integration"]}))
         return 0
     if role in ("implementer", "repair"):
+        if mode == "converge":
+            # squash-fallback repair contract: contested files byte-identical
+            # to current integration content, own work in untouched files
+            cur = subprocess.run(
+                ["git", "show", "automation/integration:app.py"],
+                cwd=cwd, capture_output=True, text=True).stdout
+            (Path(cwd) / "app.py").write_text(cur)
+            (Path(cwd) / "test_canary.py").write_text(TEST_ADD_ONLY)
+            (Path(cwd) / "converged.py").write_text("ok = True\n")
+            commit_all(cwd, f"{step}: {role} converge", key)
         if mode in ("ok", "bad_code", "two_tasks", "shared_file"):
             if step != "c1" and mode == "shared_file":
                 # deliberately touch the SAME file as other steps (conflict tests)

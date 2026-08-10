@@ -116,7 +116,17 @@ passes `capacity.can_dispatch` (pressure class, target, fable=1/opus caps,
 local-test cap). Integration stays serialized per repo
 (`repo_integration_busy` defers enter_validation; deferral is idempotent —
 DONE runs are reprocessed next tick). Stale parallel work: base recorded per
-task; ancestry + cherry-pick conflict → REPAIR, never reset. A BLOCKED step
+task; a conflicted historical sha can never be rewritten from a worktree
+(add-only), so promotion falls back to a merge-tree squash of the net
+base..head change — object-DB merge, ONE commit carrying every source sha's
+-x provenance line (idempotency grep intact), landed ff-only. NOT `git apply
+--3way`: its --check exits 0 on conflicted merges (git 2.55, measured).
+Still-conflicting overlap → REPAIR with a byte-identical-convergence
+contract (contested regions = exact integration content, own work in
+untouched regions/files — adjacent insertions do NOT merge), never reset.
+This unwedged step-04 (2026-08-10: 4 hard-fails burned on repairs that
+could not fix a promotion-side conflict). Same day, owner dropped step-01's
+24h soak (roadmap now soak-free) and step-01 was accepted directly. A BLOCKED step
 blocks only its dependents; /retry [step] resumes in-place (cold replan only
 when the worktree is gone), /abort [step] prunes.
 Controller error streak ≥8 → auto-pause + notify (never blocks a healthy step).
@@ -162,6 +172,20 @@ every worker otherwise) + billing/nesting env stripped.
 Not subscription (api key/gateway env/logged out) → all steps WAITING_AUTH,
 notify once, auto-recheck; `cmd_start` refuses launch. WAITING_AUTH is a
 WAITING state (never consumes repair budget).
+
+## /news — owner control panel for the deployed appliance (2026-08-10)
+`newsops.py` (tg `/news` + CLI `control.py news`): status (product `health`
++ install_tasks --status condensed), manual runs via `schtasks /run` on the
+installed internet-discovery-* tasks (never blocks the tick), config
+show/set. Mutations whitelisted: product .env runtime keys (digest_time/
+digest_max/intervals/max_scores, validated; cadence keys auto re-run
+`--install` because triggers are derived at install time) + interests.json
+`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload). Every
+mutated file backed up to product backups/ first; no git ops in the module;
+EC_NEWS_ROOT overrides the product root (tests). tests/test_news.py (14).
+Product deployed same day: PR #9 merged, six tasks installed+verified,
+digest flowing (see owner-repo commit e4485dc for the two live-install
+fixes).
 
 ## Roadmap DAG (roadmap.yaml)
 01,02 parallel roots · 03,04←02 (parallel) · 05←03+04 (fable planner) ·

@@ -74,6 +74,18 @@ review, 🛠 repair, 📦 promoted, ☑️ task done, ✅ accepted, ⛔ blocked)
 carry ladder round / retry counts, durations, commit counts, and roadmap
 progress.
 
+`/news` is the owner's control panel for the DEPLOYED discovery appliance in
+`C:\github\internet` (the product bot stays the delivery channel — it has no
+live listener). `/news` shows health, per-task state and pending sends;
+`/news run stocks|web|youtube|all|digest` triggers the installed Scheduled
+Tasks (a manual run is byte-identical to a scheduled one); `/news config`
+shows digest time/size, collector cadences and each interest's notify bar;
+`/news set` changes them — whitelisted keys only (digest_time, digest_max,
+collector intervals, max_scores, per-interest `bar`), every mutated file is
+backed up first, cadence changes re-register the task triggers
+automatically, and a bar change reloads the product DB. Same commands via
+CLI: `python control.py news [status|run|config|set] ...`.
+
 Commands answer within a few seconds: a long-poll listener
 (`tg_listener.py`, supervised by the `engine-control-listener` task) wakes
 the controller the moment an update arrives. If the listener dies, its
@@ -205,10 +217,11 @@ Two of them are easy to misread:
 - **SOAKING** — the step is *finished and validated*: commits are integrated
   on `automation/integration`, integration tests are green, and the normal PR
   push carries the work. Steps with `soak_minutes:` in `roadmap.yaml` then
-  hold in a real-time observation window before ACCEPTED — e.g. step-01
-  deploys always-on scheduled tasks, so it soaks 24h to prove recovery and
-  health in reality, not just in tests. **There is no owner action**: the
-  step accepts itself when the window ends (`/status` shows the exact time).
+  hold in a real-time observation window before ACCEPTED (for work that
+  should prove itself in reality — deployed schedulers, recovery paths —
+  not just in tests; no roadmap step currently uses it). **There is no owner
+  action**: the step accepts itself when the window ends (`/status` shows
+  the exact time).
   An optional `soak_check:` command runs at the end of the window; if it
   fails, the step routes into the normal repair ladder instead of accepting.
 - **WAITING_\*** (config/quota/auth) — external waits. They resume

@@ -40,7 +40,6 @@ steps:
     title: Internet as an appliance
     repos: [internet]
     depends_on: []
-    soak_minutes: 1440
     objective: |
       Make production discovery continuously operational without dependence on
       an SSH session: real scheduler, feedback listener, authenticated
@@ -51,8 +50,7 @@ steps:
     acceptance: |
       Realistic kill/recovery and dependency-failure tests (Chrome/CDP down,
       Telegram down, machine-sleep gap), not merely task creation. Health
-      state must be observable via stats.py counters. 24h soak after
-      validation.
+      state must be observable via stats.py counters.
 
   - id: step-02
     ordinal: 2
