@@ -413,7 +413,7 @@ def wait_quota(ctx, conn, step):
              if usage and not usage.get("stale") else "")
         tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
                    f"⌛ {step_label(step)} waiting on model quota (hit {streak})\n"
-                   f"{u}retry in {backoff}m (~{common.local_str(retry_at)}) · "
+                   f"{u}retry in {backoff}m (~{common.local_when(retry_at)}) · "
                    "resumes automatically")
 
 
@@ -943,7 +943,8 @@ def accept_step(ctx, conn, roadmap, step):
         db.transition(conn, ctx, step["id"], "SOAKING", f"soak {soak}m")
         tgm.notify(conn, ctx, f"soak:{step['id']}",
                    f"⏳ {step['id']} validated — soaking {soak}m "
-                   f"(accept ~{common.local_str(until)})")
+                   f"(observation window, no action needed — "
+                   f"auto-accepts ~{common.local_when(until)})")
     else:
         db.transition(conn, ctx, step["id"], "ACCEPTED", "validated")
         tgm.notify(conn, ctx, f"accepted:{step['id']}", accepted_text(conn, step))
@@ -1608,6 +1609,13 @@ def step_line(conn, s) -> str:
         word = "PENDING" if waits else "READY"
         if waits:
             bits.append("waits " + "+".join(waits))
+    elif st == "SOAKING":
+        # Validated + integrated; only the observation window remains. Ladder/
+        # retry history here reads as a live problem, so the line says the one
+        # thing that matters: it finishes by itself, and when.
+        when = (f"auto-accepts {common.local_when(s['soak_until'])}"
+                if s["soak_until"] else "auto-accepts at soak end")
+        bits.append(f"validated — {when} · no action needed")
     else:
         n = d.get("tasks_n", 0)
         if n > 1 and st in ACTIVE_TASK_STATES:
@@ -1619,10 +1627,8 @@ def step_line(conn, s) -> str:
             bits.append(f"{d['burned']}/{LADDER_MAX} hard-failed")
         if d.get("cycle"):
             bits.append(f"retry {d['cycle']}")
-        if st == "SOAKING" and s["soak_until"]:
-            bits.append(f"until {common.local_str(s['soak_until'])}")
-        elif st == "WAITING_QUOTA" and s["retry_at"]:
-            bits.append(f"retry {common.local_str(s['retry_at'])}")
+        if st == "WAITING_QUOTA" and s["retry_at"]:
+            bits.append(f"retry {common.local_when(s['retry_at'])}")
         else:
             age = _state_age_min(conn, s)
             if age is not None and age >= 1:
@@ -1787,7 +1793,7 @@ def idle_reason(conn, gov, ready) -> str:
         return f"PAUSED: {why} — /resume to continue"
     hold = db.kv_get(conn, "quota_hold_until")
     if hold and not common.is_past(hold):
-        return f"quota hold until {common.local_str(hold)}"
+        return f"quota hold until {common.local_when(hold)}"
     if gov["target"] == 0:
         return f"dispatch target 0 (pressure {gov['pressure']})"
     if not ready:
@@ -1859,6 +1865,13 @@ def why_text(ctx, conn, step_id=None) -> str:
     d = db.step_detail(step)
     cycle = d.get("cycle", 0)
     lines = [f"why {step['id']} — [{step['state']}] cycle {cycle} — {step['title']}"]
+    if step["state"] == "SOAKING":
+        when = (common.local_when(step["soak_until"]) if step["soak_until"]
+                else "soak end")
+        lines.append("soaking = post-validation observation window: the work is "
+                     "integrated and test-green; it runs in reality for the "
+                     f"configured soak_minutes, then accepts itself ~{when}. "
+                     "No action needed; the history below is how it got here.")
     if d.get("task_wt"):
         lines.append(f"ladder: round {ladder_rounds(conn, step, d)} this grant · "
                      f"{d.get('burned', 0)}/{LADDER_MAX} hard-failed · "

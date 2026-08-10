@@ -59,7 +59,12 @@ write, reported as maintenance) / quota hold / target 0 / no READY steps.
 `round r` + `f/4 hard-failed` (grant-relative), `retry k` (cycle),
 time-in-state, soak/quota
 timers; run lines show elapsed + activity age (PRs open per validated task,
-so a step legitimately keeps running after its first PR). `step_label()`
+so a step legitimately keeps running after its first PR). Future timestamps
+render day-aware (`common.local_when`: "tomorrow 19:56" — a bare HH:MM on a
+24h soak read as overdue, owner confusion 2026-08-10); SOAKING lines drop
+ladder bits for `validated — auto-accepts <when> · no action needed`, /why
+opens SOAKING with the same explanation, README documents the lifecycle
+(soak_minutes/soak_check/:validated). `step_label()`
 puts the same 1-based `(task i/n)` on every task-scoped notification;
 single-task plans stay a bare step id.
 

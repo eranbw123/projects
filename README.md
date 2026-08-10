@@ -196,6 +196,29 @@ resolves through the conflict → repair path (never a reset). Quota/limit hits
 → `WAITING_QUOTA` (persisted, notified, retried; never counts as a failed
 attempt, never falls back to API billing).
 
+## Step lifecycle & soaking
+
+A step flows PENDING → PLANNING → IMPLEMENTING → TESTING → REVIEWING (→
+REPAIRING as needed) → VALIDATING → ACCEPTED; `/status` shows every state.
+Two of them are easy to misread:
+
+- **SOAKING** — the step is *finished and validated*: commits are integrated
+  on `automation/integration`, integration tests are green, and the normal PR
+  push carries the work. Steps with `soak_minutes:` in `roadmap.yaml` then
+  hold in a real-time observation window before ACCEPTED — e.g. step-01
+  deploys always-on scheduled tasks, so it soaks 24h to prove recovery and
+  health in reality, not just in tests. **There is no owner action**: the
+  step accepts itself when the window ends (`/status` shows the exact time).
+  An optional `soak_check:` command runs at the end of the window; if it
+  fails, the step routes into the normal repair ladder instead of accepting.
+- **WAITING_\*** (config/quota/auth) — external waits. They resume
+  automatically, never consume repair budget, and only WAITING_CONFIG asks
+  anything of the owner (fill `.env`).
+
+Dependencies gate on acceptance: `depends_on: [step-x]` waits for ACCEPTED,
+while `step-x:validated` is satisfied once step-x reaches SOAKING — dependents
+that only need the code, not the soak evidence, start immediately.
+
 ## Repair ladder
 
 implementation → repair rounds (first one resumes the implementer's session) →
