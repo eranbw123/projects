@@ -25,7 +25,10 @@ def pid_alive(pid: int) -> bool:
     p = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                        capture_output=True, text=True)
     out = (p.stdout or "").strip()
-    return out.startswith('"') and str(pid) in out
+    if not out.startswith('"'):
+        return False
+    image = out.split('","')[0].strip('"').lower()
+    return image.startswith("python") and str(pid) in out
 
 
 def write_atomic(path: Path, text: str):

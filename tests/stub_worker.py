@@ -18,6 +18,14 @@ TEST_BOTH = (
     "    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n"
     "    def test_mul(self):\n        self.assertEqual(mul(2, 3), 6)\n\n\n"
     "if __name__ == '__main__':\n    unittest.main()\n")
+APP_V3 = APP_OK + "\n\ndef sub(a, b):\n    return a - b\n"
+TEST_V3 = (
+    "import unittest\n\nfrom app import add, mul, sub\n\n\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n"
+    "    def test_mul(self):\n        self.assertEqual(mul(2, 3), 6)\n\n"
+    "    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n\n\n"
+    "if __name__ == '__main__':\n    unittest.main()\n")
 
 
 def sh(args, cwd):
@@ -36,11 +44,13 @@ def main():
     cwd = os.environ["EC_CWD"]
     result = Path(os.environ["EC_RESULT"])
     seq = key.rsplit(".", 1)[1]
+    t = int(key.rsplit(".", 3)[1][1:])  # ...cN.tT.role.seq
     script = {}
     sp = os.environ.get("EC_STUB_SCRIPT")
     if sp and Path(sp).exists():
         script = json.loads(Path(sp).read_text())
-    mode = script.get(f"{role}.{seq}", script.get(role, "ok"))
+    mode = script.get(f"{role}.t{t}.{seq}",
+                      script.get(f"{role}.{seq}", script.get(role, "ok")))
     log = os.environ.get("EC_STUB_LOG")
     if log:
         with open(log, "a") as f:
@@ -64,18 +74,25 @@ def main():
 
     if role == "planner":
         step_id = key.split(".c")[0]
+        tasks = [{"repo": "canary",
+                  "objective": "add mul(a,b) returning a*b, with a test"}]
+        if mode == "two_tasks":
+            tasks.append({"repo": "canary",
+                          "objective": "add sub(a,b) returning a-b, with a test"})
         result.write_text(json.dumps({
-            "version": 1, "step_id": step_id,
-            "tasks": [{"repo": "canary",
-                       "objective": "add mul(a,b) returning a*b, with a test"}],
-            "acceptance": ["mul(2,3)==6 covered by test_canary.py"],
+            "version": 1, "step_id": step_id, "tasks": tasks,
+            "acceptance": ["canonical canary tests green"],
             "rollback_conditions": ["tests red at integration"]}))
         return 0
     if role in ("implementer", "repair"):
-        if mode in ("ok", "bad_code"):
-            (Path(cwd) / "app.py").write_text(APP_OK if mode == "ok" else APP_BAD)
-            (Path(cwd) / "test_canary.py").write_text(TEST_BOTH)
-            commit_all(cwd, f"canary: {role} {mode}", key)
+        if mode in ("ok", "bad_code", "two_tasks"):
+            if t >= 1:
+                (Path(cwd) / "app.py").write_text(APP_V3)
+                (Path(cwd) / "test_canary.py").write_text(TEST_V3)
+            else:
+                (Path(cwd) / "app.py").write_text(APP_OK if mode != "bad_code" else APP_BAD)
+                (Path(cwd) / "test_canary.py").write_text(TEST_BOTH)
+            commit_all(cwd, f"canary: {role} t{t} {mode}", key)
         result.write_text(json.dumps({
             "version": 1, "status": "done", "summary": f"{role} {mode} done",
             "decisions": ["stub decision"], "interfaces": ["app.mul"],

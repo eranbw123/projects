@@ -55,14 +55,26 @@ def repo_cfg(roadmap, name) -> dict:
 
 
 def sync_steps(conn, ctx, roadmap):
+    ids = [s["id"] for s in roadmap["steps"]]
     for s in roadmap["steps"]:
-        if not db.get_step(conn, s["id"]):
+        row = db.get_step(conn, s["id"])
+        if not row:
             with conn:
                 conn.execute(
                     "INSERT INTO steps(id,ordinal,title,repos,state,detail,updated_at)"
                     " VALUES(?,?,?,?, 'PENDING','{}',?)",
                     (s["id"], s["ordinal"], s.get("title", ""),
                      json.dumps(s.get("repos", [])), common.now()))
+        elif (row["ordinal"], row["title"], row["repos"]) != (
+                s["ordinal"], s.get("title", ""), json.dumps(s.get("repos", []))):
+            with conn:
+                conn.execute("UPDATE steps SET ordinal=?, title=?, repos=? WHERE id=?",
+                             (s["ordinal"], s.get("title", ""),
+                              json.dumps(s.get("repos", [])), s["id"]))
+    # a step edited out of the roadmap must not wedge active_step forever
+    for row in conn.execute("SELECT id,state FROM steps").fetchall():
+        if row["id"] not in ids and row["state"] not in ("ACCEPTED", "ABORTED"):
+            db.transition(conn, ctx, row["id"], "ABORTED", "removed from roadmap.yaml")
 
 
 def route_model(scfg, role):
@@ -133,24 +145,37 @@ def dispatch(ctx, conn, step, role, prompt, cwd, to_state, reason,
     cr.build_job(ctx, key, role, prompt, str(cwd), model, effort,
                  resume_session=resume_session, test_cmds=test_cmds)
     frm = step["state"]
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO runs(key,step_id,task_idx,cycle,role,model,effort,lane,"
-            "status,cwd,artifact_dir,deadline,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?, 'PREPARED', ?,?,?,?)",
-            (key, step["id"], task_idx, cycle, role, model, effort, lane,
-             str(cwd), str(cr.art_dir(ctx, key)), deadline, common.now()))
-        conn.execute("UPDATE steps SET active_run_id=?, state=?, updated_at=? WHERE id=?",
-                     (cur.lastrowid, to_state, common.now(), step["id"]))
-        if frm != to_state:
-            conn.execute(
-                "INSERT INTO transitions(ts,step_id,from_state,to_state,reason)"
-                " VALUES(?,?,?,?,?)",
-                (common.now(), step["id"], frm, to_state, ctx.redact(reason)[:500]))
+    import sqlite3 as _sq
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO runs(key,step_id,task_idx,cycle,role,model,effort,lane,"
+                "status,cwd,artifact_dir,deadline,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?, 'PREPARED', ?,?,?,?)",
+                (key, step["id"], task_idx, cycle, role, model, effort, lane,
+                 str(cwd), str(cr.art_dir(ctx, key)), deadline, common.now()))
+            conn.execute("UPDATE steps SET active_run_id=?, state=?, updated_at=? WHERE id=?",
+                         (cur.lastrowid, to_state, common.now(), step["id"]))
+            if frm != to_state:
+                conn.execute(
+                    "INSERT INTO transitions(ts,step_id,from_state,to_state,reason)"
+                    " VALUES(?,?,?,?,?)",
+                    (common.now(), step["id"], frm, to_state, ctx.redact(reason)[:500]))
+    except _sq.IntegrityError:
+        # Deterministic key already exists: this is a replay of already-planned
+        # work (crash-recovery path). Adopt the existing run instead of failing.
+        run = db.run_by_key(conn, key)
+        with conn:
+            conn.execute("UPDATE steps SET active_run_id=?, state=?, updated_at=? WHERE id=?",
+                         (run["id"], to_state, common.now(), step["id"]))
+        db.event(conn, ctx, "run_readopted", step_id=step["id"], run_id=run["id"], key=key)
+        if run["status"] == "PREPARED":
+            launch(ctx, conn, run)
+        return run
     run = db.run_by_key(conn, key)
     launch(ctx, conn, run)
     db.event(conn, ctx, "dispatched", step_id=step["id"], run_id=run["id"],
-             key=key, role=role, model=model, lane=lane, to=to_state)
+             key=key, role=role, model=model, lane=lane, frm=frm, to=to_state)
     return run
 
 
@@ -204,15 +229,16 @@ def reconcile(ctx, conn):
 
 def finalize(ctx, conn, run, rc):
     stdout = cr.read_claude_stdout(ctx, run["key"])
-    blob = json.dumps(stdout) + cr.stderr_tail(ctx, run["key"])
-    if cr.quota_hit(blob) and (rc != 0 or stdout.get("is_error")):
+    stderr = cr.stderr_tail(ctx, run["key"])
+    if cr.cli_quota(stdout, stderr, rc):
         status = "QUOTA"
     elif rc == 0:
         status = "DONE"
     else:
         status = "FAILED"
     db.finish_run(conn, ctx, run["id"], status, exit_code=rc,
-                  note=common.tail(blob, 5) if status != "DONE" else "")
+                  note=common.tail(json.dumps(stdout) + "\n" + stderr, 5)
+                  if status != "DONE" else "")
     if run["lane"] == "task":
         cr.delete_task(run["key"])
 
@@ -231,13 +257,24 @@ def set_resume(conn, step, state=None):
 
 
 def wait_quota(ctx, conn, step):
-    set_resume(conn, step)
+    d = db.step_detail(step)
+    streak = d.get("quota_streak", 0) + 1
+    d["quota_streak"] = streak
+    if step["state"] not in common.WAITING_STATES:
+        d["resume"] = step["state"]
+    db.set_detail(conn, step["id"], d)
+    if streak > 6:
+        # Repeated quota classification is almost certainly a real failure
+        # being misread; stop looping and route it to the repair ladder.
+        repair_or_block(ctx, conn, step,
+                        f"quota-classified outcome repeated x{streak}; treating as worker failure")
+        return
     retry_min = int(ctx.getenv("EC_QUOTA_RETRY_MIN", str(QUOTA_RETRY_MIN)))
     with conn:
         conn.execute("UPDATE steps SET retry_at=? WHERE id=?",
                      (common.iso_in(retry_min * 60), step["id"]))
     db.transition(conn, ctx, step["id"], "WAITING_QUOTA", "model quota/limit hit")
-    tgm.notify(conn, ctx, f"quota:{step['id']}:{common.now()[:13]}",
+    tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
                f"engine-control: {step['id']} waiting on model quota; retry in {retry_min}m")
 
 
@@ -373,20 +410,23 @@ def start_planning(ctx, conn, roadmap, step):
                f"engine-control: {step['id']} started — {step['title']}")
 
 
-def start_task_impl(ctx, conn, roadmap, step):
+def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
     d = db.step_detail(step)
     scfg = step_cfg(roadmap, step["id"])
-    repo = current_repo(ctx, step)
+    cycle = d.get("cycle", 0)
+    idx = d.get("task_idx", 0) if task_idx is None else task_idx
+    plan = common.read_json(Path(step["plan_path"])) if step["plan_path"] else None
+    repo = plan["tasks"][idx]["repo"] if plan else json.loads(step["repos"])[0]
     rc = repo_cfg(roadmap, repo)
     ws = Path(rc["workspace"])
-    cycle, idx = d.get("cycle", 0), d.get("task_idx", 0)
     branch = f"ec/{step['id']}-c{cycle}-t{idx}"
     wt = ctx.art / "wt" / f"{step['id']}-c{cycle}-t{idx}"
     base = d.get("task_base")
     if not base or d.get("task_branch") != branch:
         base = integration_sha(roadmap, repo)
-        d.update(task_base=base, task_branch=branch, task_wt=str(wt), diagnosed=False)
-        db.set_detail(conn, step["id"], d)
+    d.update(task_idx=idx, task_base=base, task_branch=branch, task_wt=str(wt),
+             diagnosed=False)
+    db.set_detail(conn, step["id"], d)
     if not wt.exists():
         gitops.worktree_add(ws, wt, branch, base)
     plan_json = Path(step["plan_path"]).read_text(encoding="utf-8") if step["plan_path"] else "{}"
@@ -460,11 +500,27 @@ def enter_validation(ctx, conn, roadmap, step):
     cur = gitops.git_ro(["rev-parse", "--abbrev-ref", "HEAD"], cwd=ws).stdout.strip()
     if cur != INTEGRATION:
         gitops.checkout(ws, INTEGRATION)
+    # A controller death mid-cherry-pick leaves CHERRY_PICK_HEAD; a fresh
+    # attempt would fail with "already in progress". Abort is non-destructive.
+    gitops.run_git(["cherry-pick", "--abort"], cwd=ws, check=False)
+    task_key = f"{step['id']}.c{d.get('cycle', 0)}.t{d.get('task_idx', 0)}"
+
+    def record(sha, integrated):
+        if not conn.execute("SELECT 1 FROM commits WHERE step_id=? AND repo=? AND sha=?",
+                            (step["id"], repo, sha)).fetchone():
+            with conn:
+                conn.execute(
+                    "INSERT INTO commits(step_id,repo,task_idx,run_key,sha,base_sha,"
+                    "integrated_sha,integrated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (step["id"], repo, d.get("task_idx", 0), task_key, sha, base,
+                     integrated, common.now()))
+
     for sha in gitops.commits_between(ws, base, head):
         already = gitops.git_ro(
             ["log", INTEGRATION, f"--grep=cherry picked from commit {sha}",
              "--format=%H", "-1"], cwd=ws, check=False).stdout.strip()
         if already:
+            record(sha, already)
             continue
         status, new_sha = cherry_pick_x(ws, sha)
         if status == "conflict":
@@ -474,12 +530,7 @@ def enter_validation(ctx, conn, roadmap, step):
                             "rebase your branch onto the current integration tip and resolve")
             return
         if status == "ok":
-            with conn:
-                conn.execute(
-                    "INSERT INTO commits(step_id,repo,task_idx,run_key,sha,base_sha,"
-                    "integrated_sha,integrated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (step["id"], repo, d.get("task_idx", 0), "", sha, base,
-                     new_sha, common.now()))
+            record(sha, new_sha)
     dispatch(ctx, conn, step, "test", "", ws, "VALIDATING",
              "integration tests on promoted commits", test_cmds=rc["tests"])
     tgm.notify(conn, ctx, f"validate:{step['id']}:c{d.get('cycle',0)}t{d.get('task_idx',0)}",
@@ -625,6 +676,10 @@ def advance(ctx, conn, roadmap):
     if run["status"] == "LOST":
         redispatch_stage(ctx, conn, roadmap, step, run)
         return
+
+    if run["status"] in ("DONE", "FAILED") and d.get("quota_streak"):
+        d.pop("quota_streak", None)
+        db.set_detail(conn, step["id"], d)
 
     handler = {
         "PLANNING": on_planning, "IMPLEMENTING": on_impl_like,
@@ -798,17 +853,17 @@ def on_validating(ctx, conn, roadmap, step, run):
                         + common.tail((obj or {}).get("report", "no artifact"), 60))
         return
     d = db.step_detail(step)
-    idx = d.get("task_idx", 0)
-    if idx + 1 < d.get("tasks_n", 1):
-        d["task_idx"] = idx + 1
-        d.pop("task_base", None)
-        d.pop("task_branch", None)
-        d["diagnosed"] = False
+    idx = run["task_idx"]  # the task this validation run actually validated
+    done = d.get("done_tasks", [])
+    if idx not in done:
+        done = sorted(done + [idx])
+        d["done_tasks"] = done
         db.set_detail(conn, step["id"], d)
-        tgm.notify(conn, ctx, f"task:{step['id']}:t{idx}",
-                   f"engine-control: {step['id']} task {idx} integrated; next task")
+        tgm.notify(conn, ctx, f"task:{step['id']}:c{d.get('cycle',0)}t{idx}:done",
+                   f"engine-control: {step['id']} task {idx} integrated and validated")
+    if len(done) < d.get("tasks_n", 1):
         step = db.get_step(conn, step["id"])
-        start_task_impl(ctx, conn, roadmap, step)
+        start_task_impl(ctx, conn, roadmap, step, task_idx=len(done))
         return
     accept_step(ctx, conn, roadmap, step)
 
@@ -904,13 +959,26 @@ def tick(ctx) -> int:
             db.kv_set(conn, "warned_no_tg", "0")
             cmds = tgm.consume(ctx, conn, tg)
             handle_commands(ctx, conn, tg, cmds)
-        reconcile(ctx, conn)
-        if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
-            try:
+        try:
+            reconcile(ctx, conn)
+            if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
                 advance(ctx, conn, roadmap)
-            except Exception as e:  # a controller bug must be visible, not a wedge
-                ctx.log(f"advance error: {e!r}")
-                db.event(conn, ctx, "advance_error", err=repr(e)[:400])
+            if db.kv_get(conn, "orch_err_streak", "0") != "0":
+                db.kv_set(conn, "orch_err_streak", "0")
+        except Exception as e:
+            # A controller bug must be loud, bounded, and never a silent loop.
+            streak = int(db.kv_get(conn, "orch_err_streak", "0")) + 1
+            db.kv_set(conn, "orch_err_streak", str(streak))
+            ctx.log(f"orchestration error x{streak}: {e!r}")
+            db.event(conn, ctx, "advance_error", err=repr(e)[:400], streak=streak)
+            if streak in (1, 5):
+                tgm.notify(conn, ctx, f"orch-error:{streak}",
+                           f"engine-control: orchestration error x{streak}: {e!r:.200}")
+            if streak >= 5:
+                step = active_step(conn)
+                if step and step["state"] not in common.HALT_STATES:
+                    goto_blocked(ctx, conn, step,
+                                 f"persistent controller error: {e!r}"[:300])
         tgm.flush(ctx, conn, tg)
         conn.close()
         return 0
@@ -948,7 +1016,9 @@ def cmd_doctor(ctx):
     bad = 0
     claude = cr.resolve_claude(ctx)
     if claude:
-        v = subprocess.run([claude, "--version"], capture_output=True, text=True).stdout.strip()
+        argv = (["cmd", "/d", "/c"] if claude.lower().endswith((".cmd", ".bat")) else []) \
+            + [claude, "--version"]
+        v = subprocess.run(argv, capture_output=True, text=True).stdout.strip()
         print(f"[ok] claude: {claude} ({v})")
     else:
         print("[FAIL] claude CLI not found"); bad = 1

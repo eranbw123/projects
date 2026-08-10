@@ -64,11 +64,17 @@ Manual reboot acceptance procedure: `tests/MANUAL_REBOOT_TEST.md`.
 - The controller owns `automation/integration` in each clone; workers get
   isolated worktrees + `ec/...` branches; the controller cherry-picks accepted
   commits (idempotent via `-x` provenance).
-- `gitops.assert_safe` mechanically refuses: any push to main/master, forced
-  pushes, ref-deletion pushes, `reset --hard`, `clean`, branch deletion or
-  rename, forced checkout, history rewriting, and any mutation outside the
+- `gitops.assert_safe` mechanically refuses controller-side git abuse: any
+  push to main/master, forced pushes (incl. `+refspec`), ref-deletion pushes,
+  `reset --hard`, `clean`, branch deletion/rename, forced checkout, history
+  rewriting, `-C`/`--git-dir` redirection, and any mutating invocation
+  (including worktree/branch/remote/config write forms) outside the
   automation roots. Push URLs of clones are additionally set to an invalid
   `DISABLED:` URL.
+- Claude workers are permission-scoped to specific git verbs (status, add,
+  commit, diff, log, show, rev-parse, ls-files, grep, rm) — no push, no
+  branch, no remote, no worktree, no config. Acceptance additionally verifies
+  base ancestry, forbidden paths, and secrets before anything is promoted.
 - Worker env is stripped of `ANTHROPIC_API_KEY` etc. — subscription auth only,
   no accidental API billing. `doctor` warns if such keys exist.
 - Secrets are redacted from events, notifications and logs; result diffs are

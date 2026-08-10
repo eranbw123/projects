@@ -45,10 +45,20 @@ ROLES = {
                                "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)"]),
     "implementer": dict(model="sonnet", effort="high", pm="acceptEdits", deadline_min=120,
                         tools=["Read", "Edit", "Write", "Grep", "Glob",
-                               "Bash(git:*)", "Bash(python:*)"]),
+                               "Bash(git status:*)", "Bash(git add:*)",
+                               "Bash(git commit:*)", "Bash(git diff:*)",
+                               "Bash(git log:*)", "Bash(git show:*)",
+                               "Bash(git rev-parse:*)", "Bash(git ls-files:*)",
+                               "Bash(git grep:*)", "Bash(git rm:*)",
+                               "Bash(python:*)"]),
     "repair":      dict(model="sonnet", effort="high", pm="acceptEdits", deadline_min=90,
                         tools=["Read", "Edit", "Write", "Grep", "Glob",
-                               "Bash(git:*)", "Bash(python:*)"]),
+                               "Bash(git status:*)", "Bash(git add:*)",
+                               "Bash(git commit:*)", "Bash(git diff:*)",
+                               "Bash(git log:*)", "Bash(git show:*)",
+                               "Bash(git rev-parse:*)", "Bash(git ls-files:*)",
+                               "Bash(git grep:*)", "Bash(git rm:*)",
+                               "Bash(python:*)"]),
     "reviewer":    dict(model="opus", effort="high", pm=None, deadline_min=35,
                         tools=["Read", "Grep", "Glob", "Write",
                                "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)",
@@ -72,19 +82,37 @@ BILLING_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY",
 QUOTA_RE = re.compile(
     r"(usage limit|rate.?limit|limit (?:reached|will reset)|out of (?:usage|quota)"
     r"|quota|too many requests|overloaded|resets at|\b429\b)", re.I)
+# Narrow forms for raw (non-JSON) CLI output only — must not match repo test
+# output that merely discusses rate limits (e.g. "expected RateLimitError").
+QUOTA_NARROW_RE = re.compile(
+    r"(claude usage limit|usage limit reached|rate limited\b|overloaded_error"
+    r"|too many requests)", re.I)
 
 FABLE_FORBIDDEN_RE = re.compile(
-    r"(conversations\.db|raw_conversations|chatgpt_export|full conversation transcript)", re.I)
+    r"(\"(?:role|sender)\":\s*\"(?:user|human|assistant)\""
+    r"|SELECT\s+.{0,80}\bFROM\s+raw_conversations"
+    r"|BEGIN RAW CONVERSATION|full conversation transcript)", re.I)
 
 
 def fable_payload_ok(prompt_text: str) -> bool:
-    """Fable privacy boundary: no raw conversation stores in fable prompts.
-    Architecture summaries/diffs/metrics only (enforced again by prompt policy)."""
+    """Fable privacy boundary: no raw conversation BODIES in fable prompts
+    (message-array shapes, raw_conversations dumps). Mentioning the store by
+    name in architecture text is fine — step handoffs legitimately do."""
     return not FABLE_FORBIDDEN_RE.search(prompt_text)
 
 
-def quota_hit(text: str) -> bool:
-    return bool(QUOTA_RE.search(text or ""))
+def cli_quota(stdout_obj, stderr_text: str, rc: int) -> bool:
+    """QUOTA only when the Claude CLI itself reports a limit — never from
+    worker-produced content (test names/assertions about rate limits)."""
+    if isinstance(stdout_obj, dict) and "raw" not in stdout_obj:
+        if not stdout_obj.get("is_error"):
+            return False
+        blob = f"{stdout_obj.get('result', '')} {stdout_obj.get('subtype', '')}"
+        return bool(QUOTA_RE.search(blob))
+    if rc == 0:
+        return False
+    raw = str((stdout_obj or {}).get("raw", ""))
+    return bool(QUOTA_NARROW_RE.search(stderr_text or "") or QUOTA_NARROW_RE.search(raw))
 
 
 def art_dir(ctx: common.Ctx, key: str) -> Path:
@@ -206,10 +234,17 @@ def spawn(ctx: common.Ctx, key: str, lane: str) -> dict:
 
 
 def pid_alive(pid: int) -> bool:
+    """True only if the pid exists AND is a python image (the shim is always
+    python). Guards probe/kill against PID reuse after reboot — a reused pid
+    of another program must never be treated as ours, let alone taskkilled."""
     p = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                        capture_output=True, text=True)
-    line = (p.stdout or "").strip().lower()
-    return line.startswith('"') and (f",\"{pid}\"," in line.replace(" ", "") or str(pid) in line)
+    line = (p.stdout or "").strip()
+    if not line.startswith('"'):
+        return False
+    cols = line.split('","')
+    image = cols[0].strip('"').lower()
+    return image.startswith("python") and str(pid) in line
 
 
 def task_status(tn: str) -> str | None:

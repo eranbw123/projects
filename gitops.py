@@ -1,11 +1,12 @@
 """Git operations with a mechanical safety guard.
 
 Every git invocation goes through run_git(). The guard enforces:
-- no push unless explicitly allowed, and never to main/master, never forced,
-  never a ref deletion;
+- no push unless explicitly allowed, and never to main/master, never forced
+  (including +refspec force syntax), never a ref deletion;
 - no `reset --hard`, no `clean`, no branch deletion/rename, no history rewrite;
-- mutations only inside approved automation roots (owner working copies under
-  C:\\github are read-only source).
+- no -C/--git-dir/--work-tree redirection (a cwd-check bypass);
+- mutations require an explicit cwd inside approved automation roots (owner
+  working copies under C:\\github are read-only sources, always).
 Recovery uses only non-destructive operations (cherry-pick --abort etc.).
 """
 from __future__ import annotations
@@ -53,29 +54,56 @@ def _under(path: Path, roots: list[Path]) -> bool:
     return False
 
 
+def _is_mutating(sub: str, toks: list[str], low: list[str]) -> bool:
+    """Classify an invocation, not just a subcommand: worktree/branch/remote/
+    config have both read and write forms (audit finding: the write forms were
+    previously classified read-only)."""
+    if sub == "worktree":
+        return any(t in ("add", "remove", "prune", "move", "repair", "lock", "unlock")
+                   for t in low[1:])
+    if sub == "branch":
+        # any positional argument means create (delete/rename already raised)
+        return bool([t for t in toks[1:] if not t.startswith("-")])
+    if sub == "remote":
+        return any(t in ("add", "remove", "rm", "rename", "set-url", "set-head",
+                         "set-branches", "prune", "update") for t in low)
+    if sub == "config":
+        return not any(t in ("--get", "--list", "--get-all", "--get-regexp") for t in low)
+    return sub not in READ_ONLY_SUBCOMMANDS
+
+
 def assert_safe(args: list[str], cwd, allow_push: bool = False) -> None:
     toks = [str(a) for a in args]
     low = [t.lower() for t in toks]
+    for t in low:
+        if t in ("-c", "--git-dir", "--work-tree") or \
+           t.startswith(("--git-dir=", "--work-tree=")):
+            raise GitSafetyError(f"global redirection flag forbidden: {t}")
     sub = next((t for t in low if not t.startswith("-")), "")
 
     if sub == "push":
         if not allow_push:
             raise GitSafetyError("push is disabled for the controller")
-        if any(t in ("-f", "--force", "--force-with-lease", "--mirror", "--delete", "-d") for t in low):
+        if any(t in ("-f", "--force", "--force-with-lease", "--mirror", "--delete", "-d")
+               for t in low):
             raise GitSafetyError("forced/deleting push forbidden")
         for t in toks[1:]:
-            base = t.split(":")[-1].strip().lower()
-            if t.strip().startswith(":"):
+            spec = t.strip()
+            if spec.startswith("+"):
+                raise GitSafetyError("force refspec (+ref) forbidden")
+            if spec.startswith(":"):
                 raise GitSafetyError("ref-deletion push forbidden")
+            base = spec.split(":")[-1].strip().lower().lstrip("+")
             if base in ("main", "master", "refs/heads/main", "refs/heads/master"):
                 raise GitSafetyError("push to main/master forbidden")
     if sub == "reset" and any(t == "--hard" for t in low):
         raise GitSafetyError("reset --hard forbidden")
     if sub == "clean":
         raise GitSafetyError("git clean forbidden")
-    if sub == "branch" and any(t in ("-d", "-D", "--delete", "-m", "-M", "--move") for t in low):
+    if sub == "branch" and any(t in ("-d", "-D", "--delete", "-m", "-M", "--move")
+                               for t in low):
         raise GitSafetyError("branch deletion/rename forbidden")
-    if sub in ("filter-branch", "filter-repo", "gc", "prune", "reflog") and sub != "reflog":
+    if sub in ("filter-branch", "filter-repo", "gc", "prune"):
         raise GitSafetyError(f"{sub} forbidden")
     if sub == "reflog" and any(t in ("expire", "delete") for t in low):
         raise GitSafetyError("reflog expire/delete forbidden")
@@ -83,19 +111,15 @@ def assert_safe(args: list[str], cwd, allow_push: bool = False) -> None:
         raise GitSafetyError("update-ref -d forbidden")
     if sub == "checkout" and any(t in ("-f", "--force") for t in low):
         raise GitSafetyError("forced checkout forbidden")
-    if sub == "worktree" and "remove" in low and any(t in ("-f", "--force") for t in low):
-        pass  # allowed: removing our own throwaway worktrees, never a branch
 
-    mutating = sub not in READ_ONLY_SUBCOMMANDS
-    if sub == "worktree" and not any(t in ("add", "remove", "prune") for t in low):
-        mutating = False
-    if sub == "config" and "--get" not in low and "--list" not in low and "--get-all" not in low:
-        mutating = True
-    if mutating and cwd is not None and not _under(Path(cwd), _write_roots()):
-        raise GitSafetyError(f"mutating git op outside automation roots: {cwd}")
-    # Owner working copies are never a mutation target, even if roots change.
-    if mutating and cwd is not None and _under(Path(cwd), [Path(r"C:\github")]):
-        raise GitSafetyError("owner repos under C:\\github are read-only")
+    if _is_mutating(sub, toks, low):
+        if cwd is None:
+            raise GitSafetyError(f"mutating git op requires an explicit cwd: {sub}")
+        if not _under(Path(cwd), _write_roots()):
+            raise GitSafetyError(f"mutating git op outside automation roots: {cwd}")
+        # Owner working copies are never a mutation target, even if roots change.
+        if _under(Path(cwd), [Path(r"C:\github")]):
+            raise GitSafetyError("owner repos under C:\\github are read-only")
 
 
 def run_git(args: list[str], cwd=None, allow_push=False, check=True,
@@ -110,9 +134,10 @@ def run_git(args: list[str], cwd=None, allow_push=False, check=True,
 
 def git_ro(args: list[str], cwd, check=True) -> subprocess.CompletedProcess:
     """Read-only queries (allowed against owner repos)."""
-    sub = next((a for a in args if not a.startswith("-")), "")
-    if sub not in READ_ONLY_SUBCOMMANDS:
-        raise GitSafetyError(f"git_ro used for non-read-only subcommand: {sub}")
+    toks = [str(a).lower() for a in args]
+    sub = next((a for a in toks if not a.startswith("-")), "")
+    if sub not in READ_ONLY_SUBCOMMANDS or _is_mutating(sub, [str(a) for a in args], toks):
+        raise GitSafetyError(f"git_ro used for non-read-only invocation: {args}")
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120)
     if check and p.returncode != 0:
         raise GitError(f"git {' '.join(args)} rc={p.returncode}: {p.stderr.strip()[:400]}")
@@ -189,27 +214,6 @@ def diff_text(repo: Path, base: str, head: str, max_lines=4000) -> str:
     if len(lines) > max_lines:
         lines = lines[:max_lines] + [f"... [diff truncated at {max_lines} lines]"]
     return "\n".join(lines)
-
-
-def log_has_key(repo: Path, ref: str, key: str) -> str | None:
-    """First commit on ref whose message carries our idempotency trailer."""
-    p = git_ro(["log", ref, f"--grep=EC-Key: {key}", "--format=%H", "-1"], cwd=repo, check=False)
-    sha = p.stdout.strip().splitlines()
-    return sha[0] if sha else None
-
-
-def cherry_pick(repo: Path, sha: str) -> tuple[str, str | None]:
-    """Returns ("ok", new_sha) | ("empty", None) | ("conflict", None).
-    On conflict the cherry-pick is aborted — never resolved destructively."""
-    p = run_git(["cherry-pick", sha], cwd=repo, check=False)
-    if p.returncode == 0:
-        return "ok", current_sha(repo)
-    err = (p.stdout + p.stderr).lower()
-    if "empty" in err and "cherry-pick" in err:
-        run_git(["cherry-pick", "--skip"], cwd=repo, check=False)
-        return "empty", None
-    run_git(["cherry-pick", "--abort"], cwd=repo, check=False)
-    return "conflict", None
 
 
 def head_commit_message(repo: Path, sha: str) -> str:

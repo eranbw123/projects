@@ -340,6 +340,100 @@ class TestCherryConflict(FlowBase):
         self.assertEqual(tip, injected_tip, "no destructive recovery on integration")
 
 
+class TestMultiTask(FlowBase):
+    """Cross-repo-shaped plans: ordered tasks, each with its own worktree and
+    integration; step accepted only after every task validates."""
+    script = {"planner": "two_tasks"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        self.assertEqual(d.get("done_tasks"), [0, 1])
+        for idx in (0, 1):
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM commits WHERE task_idx=? AND integrated_sha "
+                "IS NOT NULL", (idx,)).fetchone()["c"]
+            self.assertGreaterEqual(n, 1, f"task {idx} not integrated")
+        conn.close()
+        app = (Path(self.sb.ws) / "app.py").read_text()
+        self.assertIn("def mul", app)
+        self.assertIn("def sub", app)
+
+
+class TestTaskAdvanceCrashSafe(FlowBase):
+    """Audit finding 1 regression: a crash after task 0 is marked done but
+    before task 1 dispatches must resume task 1 — never skip it, never accept
+    the step early, never duplicate the task-1 worker."""
+    script = {"planner": "two_tasks"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.run_until(
+            lambda c: db.step_detail(self.sb.step_row(c)).get("done_tasks") == [0], 120),
+            self.sb.transitions())
+        conn = self.sb.conn()
+        val0 = conn.execute(
+            "SELECT * FROM runs WHERE role='test' AND task_idx=0 AND status='DONE' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(val0)
+        with conn:  # freeze the exact crash window state
+            conn.execute("UPDATE steps SET state='VALIDATING', active_run_id=? "
+                         "WHERE id='c1'", (val0["id"],))
+        conn.close()
+        self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        self.assertEqual(d.get("done_tasks"), [0, 1], "a task was skipped")
+        impls_t1 = conn.execute(
+            "SELECT COUNT(*) c FROM runs WHERE role='implementer' AND task_idx=1"
+            ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(impls_t1, 1, "replay duplicated the task-1 worker")
+
+
+class TestRetryCycle(FlowBase):
+    """/retry re-arms a BLOCKED step with a fresh cycle and a fresh ladder."""
+    script = {"implementer": "fail", "repair": "fail"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("BLOCKED", 150), self.sb.transitions())
+        ctx = self.sb.ctx()
+        conn = self.sb.conn()
+        sent = []
+
+        class T:
+            def send(self, t):
+                sent.append(t)
+                return True
+        import control as _c
+        _c.handle_commands(ctx, conn, T(), ["/retry"])
+        conn.close()
+        self.assertTrue(any("re-armed" in s for s in sent), sent)
+        self.sb.set_script({})  # new cycle succeeds
+        self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        self.assertEqual(d.get("cycle"), 1)
+        ok_impl = conn.execute(
+            "SELECT COUNT(*) c FROM runs WHERE cycle=1 AND role='implementer' "
+            "AND status='DONE'").fetchone()["c"]
+        conn.close()
+        self.assertEqual(ok_impl, 1)
+
+
+class TestReviewerBlock(FlowBase):
+    """Reviewer BLOCK verdict halts the step without burning repair rungs."""
+    script = {"reviewer.1": "block"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("BLOCKED", 90), self.sb.transitions())
+        conn = self.sb.conn()
+        repairs = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='repair'"
+                               ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(repairs, 0)
+
+
 class TestSupervision(unittest.TestCase):
     """Windows process-supervision reality checks (SSH/tick-death immunity)."""
 

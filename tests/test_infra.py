@@ -153,11 +153,33 @@ class TestInfra(unittest.TestCase):
         # push disabled entirely without allow_push
         with self.assertRaises(gitops.GitSafetyError):
             gitops.assert_safe(["push", "origin", "topic"], self.sb.ws, allow_push=False)
-        # mutations against owner repos always refused
+        # mutations against owner repos always refused — including the
+        # worktree/branch/remote forms the audit found misclassified
+        for args in (["commit", "-m", "x"],
+                     ["worktree", "add", "wt", "HEAD"],
+                     ["branch", "evil", "HEAD"],
+                     ["remote", "set-url", "--push", "origin", "x"],
+                     ["config", "user.name", "x"],
+                     ["cherry-pick", "abc123"]):
+            with self.assertRaises(gitops.GitSafetyError, msg=str(args)):
+                gitops.assert_safe(args, r"C:\github\internet")
+        # -C redirection bypass and force-refspec push are refused
         with self.assertRaises(gitops.GitSafetyError):
-            gitops.assert_safe(["commit", "-m", "x"], r"C:\github\internet")
+            gitops.assert_safe(["-C", r"C:\github\internet", "commit", "-m", "x"], None)
+        with self.assertRaises(gitops.GitSafetyError):
+            gitops.assert_safe(["push", "origin", "+main"], self.sb.ws, allow_push=True)
+        with self.assertRaises(gitops.GitSafetyError):
+            gitops.assert_safe(["push", "origin", "+topic"], self.sb.ws, allow_push=True)
+        # mutating ops require an explicit cwd
+        with self.assertRaises(gitops.GitSafetyError):
+            gitops.assert_safe(["commit", "-m", "x"], None)
+        # the same mutations are allowed inside the automation workspace
+        gitops.assert_safe(["worktree", "add", "wt", "HEAD"], self.sb.ws)
+        gitops.assert_safe(["branch", "b", "HEAD"], self.sb.ws)
+        gitops.assert_safe(["remote", "set-url", "--push", "origin", "x"], self.sb.ws)
         # read-only against owner repos is fine
         gitops.assert_safe(["log", "-1"], r"C:\github\internet")
+        gitops.assert_safe(["worktree", "list"], r"C:\github\internet")
 
     def test_19_pushurl_disabled_in_workspace(self):
         out = subprocess.run(["git", "remote", "get-url", "--push", "origin"],
@@ -177,9 +199,18 @@ class TestInfra(unittest.TestCase):
         self.assertTrue(vd.secrets_in_text("val secretvalue123", ["secretvalue123"]))
 
     def test_quota_detection(self):
-        self.assertTrue(cr.quota_hit("Claude usage limit reached. resets at 7pm"))
-        self.assertTrue(cr.quota_hit("429 too many requests"))
-        self.assertFalse(cr.quota_hit("SyntaxError: invalid syntax"))
+        # CLI-reported limits are QUOTA
+        self.assertTrue(cr.cli_quota(
+            {"is_error": True, "result": "Claude usage limit reached. resets at 7pm"}, "", 1))
+        self.assertTrue(cr.cli_quota({"raw": ""}, "Claude usage limit reached", 1))
+        # worker output that merely MENTIONS rate limits must NOT be QUOTA
+        # (audit finding: repo tests discuss 429s/rate limits constantly)
+        self.assertFalse(cr.cli_quota(
+            {"raw": "AssertionError: expected RateLimitError in test_quota_budget"},
+            "FAILED test_429_backoff: rate limit handling", 3))
+        self.assertFalse(cr.cli_quota(
+            {"is_error": False, "result": "implemented rate limit handling"}, "", 0))
+        self.assertFalse(cr.cli_quota({"raw": "SyntaxError"}, "SyntaxError", 2))
 
     def test_cmd_shim_wrapped_against_autorun(self):
         """claude.CMD workers must run under cmd /d /c or this machine's
@@ -203,8 +234,12 @@ class TestInfra(unittest.TestCase):
                 os.environ["EC_WORKER_CMD"] = old
 
     def test_fable_privacy_guard(self):
-        self.assertFalse(cr.fable_payload_ok("please analyze conversations.db rows"))
+        # raw conversation BODIES and dumps are blocked
+        self.assertFalse(cr.fable_payload_ok('{"role": "user", "content": "hi"}'))
         self.assertFalse(cr.fable_payload_ok("SELECT * FROM raw_conversations"))
+        # architecture text may NAME the store (step handoffs do — audit fix)
+        self.assertTrue(cr.fable_payload_ok(
+            "internet must never couple to raw conversations.db"))
         self.assertTrue(cr.fable_payload_ok("architecture summary and diffs only"))
 
     def test_gitignore_covers_state(self):
