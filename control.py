@@ -1088,6 +1088,13 @@ def cmd_doctor(ctx):
 
 
 def main(argv=None):
+    # Console codepage on this machine is cp1255; make CLI output safe for the
+    # status marks regardless of terminal encoding.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     ap = argparse.ArgumentParser(prog="control.py")
     ap.add_argument("cmd", choices=["tick", "start", "status", "pause", "resume",
                                     "retry", "abort", "log", "init", "doctor",
