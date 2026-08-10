@@ -43,14 +43,22 @@ def main():
     key = os.environ["EC_KEY"]
     cwd = os.environ["EC_CWD"]
     result = Path(os.environ["EC_RESULT"])
-    seq = key.rsplit(".", 1)[1]
-    t = int(key.rsplit(".", 3)[1][1:])  # ...cN.tT.role.seq
+    parts = key.split(".")
+    seq = parts[-1]
+    t = int(parts[-3][1:])  # ...cN.tT.role.seq
+    step = ".".join(parts[:-4])
     script = {}
     sp = os.environ.get("EC_STUB_SCRIPT")
     if sp and Path(sp).exists():
         script = json.loads(Path(sp).read_text())
-    mode = script.get(f"{role}.t{t}.{seq}",
-                      script.get(f"{role}.{seq}", script.get(role, "ok")))
+    mode = None
+    for k in (f"{step}.{role}.t{t}.{seq}", f"{step}.{role}.{seq}", f"{step}.{role}",
+              f"{role}.t{t}.{seq}", f"{role}.{seq}", role):
+        if k in script:
+            mode = script[k]
+            break
+    if mode is None:
+        mode = "ok"
     log = os.environ.get("EC_STUB_LOG")
     if log:
         with open(log, "a") as f:
@@ -73,26 +81,40 @@ def main():
         return 0
 
     if role == "planner":
-        step_id = key.split(".c")[0]
-        tasks = [{"repo": "canary",
-                  "objective": "add mul(a,b) returning a*b, with a test"}]
-        if mode == "two_tasks":
-            tasks.append({"repo": "canary",
-                          "objective": "add sub(a,b) returning a-b, with a test"})
+        repo = script.get(f"{step}.repo", "canary")
+        if step == "c1" or mode == "two_tasks":
+            tasks = [{"repo": repo,
+                      "objective": "add mul(a,b) returning a*b, with a test"}]
+            if mode == "two_tasks":
+                tasks.append({"repo": repo,
+                              "objective": "add sub(a,b) returning a-b, with a test"})
+        else:
+            tasks = [{"repo": repo, "objective": f"add feature module for {step}"}]
         result.write_text(json.dumps({
-            "version": 1, "step_id": step_id, "tasks": tasks,
+            "version": 1, "step_id": step, "tasks": tasks,
             "acceptance": ["canonical canary tests green"],
             "rollback_conditions": ["tests red at integration"]}))
         return 0
     if role in ("implementer", "repair"):
-        if mode in ("ok", "bad_code", "two_tasks"):
-            if t >= 1:
+        if mode in ("ok", "bad_code", "two_tasks", "shared_file"):
+            if step != "c1" and mode == "shared_file":
+                # deliberately touch the SAME file as other steps (conflict tests)
+                (Path(cwd) / "app.py").write_text(
+                    APP_OK + f"\n\n# {step} was here\n")
+                commit_all(cwd, f"{step}: {role} shared_file", key)
+            elif step != "c1":
+                # per-step feature file: parallel steps never overlap on paths
+                (Path(cwd) / f"feat_{step}.py").write_text(
+                    f"def feat():\n    return '{step}'\n")
+                commit_all(cwd, f"{step}: {role} t{t} {mode}", key)
+            elif t >= 1:
                 (Path(cwd) / "app.py").write_text(APP_V3)
                 (Path(cwd) / "test_canary.py").write_text(TEST_V3)
+                commit_all(cwd, f"canary: {role} t{t} {mode}", key)
             else:
                 (Path(cwd) / "app.py").write_text(APP_OK if mode != "bad_code" else APP_BAD)
                 (Path(cwd) / "test_canary.py").write_text(TEST_BOTH)
-            commit_all(cwd, f"canary: {role} t{t} {mode}", key)
+                commit_all(cwd, f"canary: {role} t{t} {mode}", key)
         result.write_text(json.dumps({
             "version": 1, "status": "done", "summary": f"{role} {mode} done",
             "decisions": ["stub decision"], "interfaces": ["app.mul"],
@@ -100,7 +122,7 @@ def main():
             "hypotheses_supported": [], "hypotheses_falsified": [],
             "implications": "none"}))
         return 0
-    if role == "reviewer":
+    if role in ("reviewer", "audit"):
         if mode == "pass_slow":
             time.sleep(3)
             mode = "pass"

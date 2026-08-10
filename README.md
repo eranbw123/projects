@@ -2,19 +2,43 @@
 
 Small, durable autonomous development orchestrator for the `internet` and `ai`
 repos. Plans, implements, independently reviews, validates, repairs,
-checkpoints and hands off sequential roadmap steps, notifying the owner
-through Telegram. Survives SSH disconnects, Claude crashes, controller
-crashes, machine sleep and restarts.
+checkpoints and hands off roadmap steps organized as a dependency DAG,
+notifying the owner through Telegram. Survives SSH disconnects, Claude
+crashes, controller crashes, machine sleep and restarts. Detects the Claude
+subscription tier (Pro / Max 5x / Max 20x) and live 5h/7d utilization
+automatically and adapts its parallelism — switching plans requires no
+configuration.
 
 ## How it runs
 
 A Windows Scheduled Task (`engine-control-tick`) runs `python control.py tick`
-about once per minute. Each tick is short-lived and idempotent: single-instance
-lock → consume Telegram commands → reconcile detached workers → at most one
-orchestration action → exit. All state lives in `state.db` (SQLite, WAL);
+about once per minute. Each tick is short-lived and idempotent:
+single-instance lock → consume Telegram commands → reconcile detached
+workers → ingest capacity/utilization telemetry → advance every in-flight
+step (finishing work first, critical path next) → start READY steps while
+active Claude workers are under the dynamic concurrency target (bounded
+dispatches per tick) → exit. All state lives in `state.db` (SQLite, WAL);
 `events` is an append-only ledger. Workers (Claude Code CLI or deterministic
 test runs) execute detached through `worker_shim.py`, so nothing depends on an
 SSH session or on the tick that launched them.
+
+## Automatic capacity detection (plan_mode = AUTO)
+
+The controller infers the effective Claude subscription from sanitized
+evidence only: `claude auth status` output plus whitelisted non-secret fields
+of `.claude.json` (`organizationRateLimitTier` → max5/max20, organization
+type, profile freshness). Credentials files are never parsed. Conflicting or
+stale caches resolve by freshness, fall back conservatively, and trigger a
+tiny bounded haiku "refresh probe" (rate-limited) until resolved. Utilization
+(5-hour and 7-day windows) comes from Claude Code's own usage cache plus an
+automation-only statusline hook; high pressure first stops background work,
+then new implementation, and near exhaustion preserves capacity for reviews,
+repairs and validation. A CLI-reported quota hit pauses dispatch until the
+known reset (WAITING_QUOTA — never counted as a failure, never billed to an
+API key). Upgrading Max 5x → Max 20x mid-run fills new lanes automatically;
+downgrading drains gracefully without killing useful in-flight workers.
+`/profile max5|max20|pro` exists only as a debugging override; `/profile
+auto` (the default) clears it.
 
 ## Commands
 
@@ -32,7 +56,10 @@ python control.py install-task   # install the once-per-minute tick task
 python control.py uninstall-task
 ```
 
-Telegram commands (same actions): `/status /pause /resume /retry /abort /log`.
+Telegram commands: `/status /pause /resume /log`, `/retry [step-id]` (re-arm
+BLOCKED steps), `/abort [step-id]` (abort one step; its dependents never
+start; independent branches continue), `/profile auto|max5|max20|pro`
+(capacity override — debug only), `/pace auto|economy|balanced|sprint`.
 
 ## Telegram setup (required before the roadmap runs)
 
@@ -82,27 +109,39 @@ Manual reboot acceptance procedure: `tests/MANUAL_REBOOT_TEST.md`.
 - Fable never receives raw conversation data (mechanical prompt guard +
   prompt policy).
 
-## Model policy
+## Model policy & parallelism
 
 planner/reviewer/diagnostic: Opus · implementer/repair: Sonnet (high effort) ·
-fable: step-5/8/10 planning + final audits only (see `roadmap.yaml` `models:`).
-Quota/limit hits → `WAITING_QUOTA` (persisted, notified, retried; never counts
-as a failed attempt, never falls back to API billing).
+fable: step-5/8/10 planning + the step-11 final audit only (see `roadmap.yaml`
+`models:`), capped at ONE concurrent fable lane. Speed comes from parallel
+independent steps (per detected capacity envelope: Max20 4–5 workers, Max5
+2–3, Pro 1–2), not from bigger models. Local test runs use a separate
+semaphore and never consume Claude slots. Integration is serialized per
+repository; parallel worktrees record their base commit, and overlapping work
+resolves through the conflict → repair path (never a reset). Quota/limit hits
+→ `WAITING_QUOTA` (persisted, notified, retried; never counts as a failed
+attempt, never falls back to API billing).
 
 ## Repair ladder
 
 implementation → repair 1 (resumes implementer session) → repair 2 (fresh
 session) → independent diagnostic (Opus, read-only) → final targeted repair →
-BLOCKED. Waits/interruptions never consume rungs. A BLOCKED step halts the
-roadmap — later steps are never started over a failed dependency.
+BLOCKED. Waits/interruptions never consume rungs. A BLOCKED step blocks only
+its dependents — steps on independent branches continue; dependents are never
+started over a failed dependency.
 
 ## Tests
 
 ```
 cd tests
-python test_infra.py     # 12 unit tests (lock, guard, telegram, redaction...)
-python -m unittest test_flow   # 15 canary scenarios (full acceptance matrix)
+python test_infra.py           # unit: lock, git guard, telegram, redaction...
+python -m unittest test_flow   # canary scenarios (acceptance matrix)
+python -m unittest test_capacity  # plan-detector + telemetry + governor matrix
+python -m unittest test_dag    # DAG, capacity transitions, concurrent recovery
+python ..\scripts\smoke_real.py   # tiny REAL-Claude smoke (2 haiku calls)
 ```
 
 Canary tests stub only the model (`tests/stub_worker.py`); dispatch,
-supervision, git promotion and validation paths are real.
+supervision, git promotion and validation paths are real. Test roots use
+`harness.mkroot()` — never `tempfile.mkdtemp`, whose restricted Windows DACL
+is unreadable from the Task Scheduler session.

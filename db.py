@@ -56,7 +56,24 @@ CREATE TABLE IF NOT EXISTS commits(
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER, kind TEXT, path TEXT, sha256 TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS plan_detections(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL, tier TEXT, confidence TEXT, auth_mode TEXT, family TEXT,
+  prev_tier TEXT, trigger TEXT, evidence TEXT);   -- sanitized claims only
+CREATE TABLE IF NOT EXISTS telemetry(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,                 -- ingest time
+  session_id TEXT, source TEXT,     -- statusline | cli_cache
+  fetched_at TEXT,                  -- when the numbers were true
+  pct5 REAL, reset5 TEXT, pct7 REAL, reset7 TEXT, model TEXT);
 """
+
+# Columns added after Step 0; ALTER guarded so existing DBs migrate in place.
+_STEP_COLS = [
+    ("depends_on", "TEXT NOT NULL DEFAULT '[]'"),
+    ("background", "INTEGER NOT NULL DEFAULT 0"),
+    ("audit", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 def connect(ctx: common.Ctx) -> sqlite3.Connection:
@@ -65,6 +82,10 @@ def connect(ctx: common.Ctx) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript(SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(steps)")}
+    for col, decl in _STEP_COLS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE steps ADD COLUMN {col} {decl}")
     return conn
 
 

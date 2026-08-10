@@ -15,6 +15,7 @@ import os
 import sys
 from pathlib import Path
 
+import capacity as cap
 import claude_runner as cr
 import common
 import db
@@ -54,24 +55,83 @@ def repo_cfg(roadmap, name) -> dict:
     return roadmap["repos"][name]
 
 
+def dag_errors(roadmap) -> list[str]:
+    """Unknown dependencies and cycles are configuration errors: the roadmap
+    must never start (or silently skip) on a broken DAG."""
+    errs = []
+    ids = {s["id"] for s in roadmap["steps"]}
+    deps = {}
+    for s in roadmap["steps"]:
+        ds = []
+        for d in s.get("depends_on", []) or []:
+            base = str(d).split(":")[0]
+            if base not in ids:
+                errs.append(f"{s['id']}: unknown dependency '{d}'")
+            ds.append(base)
+        deps[s["id"]] = ds
+    seen, stack = {}, []
+
+    def visit(n):
+        if seen.get(n) == 1:
+            errs.append("dependency cycle: " + " -> ".join(stack + [n]))
+            return
+        if n in seen:
+            return
+        seen[n] = 1
+        stack.append(n)
+        for d in deps.get(n, []):
+            visit(d)
+        stack.pop()
+        seen[n] = 2
+
+    for n in deps:
+        visit(n)
+    return errs
+
+
+def crit_weight(roadmap) -> dict:
+    """Longest downstream chain per step (unit weights): how many critical
+    steps a completion unblocks. Background steps never add weight."""
+    dependents = {s["id"]: [] for s in roadmap["steps"]}
+    bg = {s["id"]: bool(s.get("background")) for s in roadmap["steps"]}
+    for s in roadmap["steps"]:
+        for d in s.get("depends_on", []) or []:
+            base = str(d).split(":")[0]
+            if base in dependents:
+                dependents[base].append(s["id"])
+    memo = {}
+
+    def w(n):
+        if n in memo:
+            return memo[n]
+        memo[n] = 0 if bg[n] else 1 + max((w(d) for d in dependents[n]
+                                           if not bg[d]), default=0)
+        return memo[n]
+
+    return {n: w(n) for n in dependents}
+
+
 def sync_steps(conn, ctx, roadmap):
     ids = [s["id"] for s in roadmap["steps"]]
     for s in roadmap["steps"]:
         row = db.get_step(conn, s["id"])
+        vals = (s["ordinal"], s.get("title", ""), json.dumps(s.get("repos", [])),
+                json.dumps(s.get("depends_on", []) or []),
+                1 if s.get("background") else 0, 1 if s.get("audit") else 0)
         if not row:
             with conn:
                 conn.execute(
-                    "INSERT INTO steps(id,ordinal,title,repos,state,detail,updated_at)"
-                    " VALUES(?,?,?,?, 'PENDING','{}',?)",
-                    (s["id"], s["ordinal"], s.get("title", ""),
-                     json.dumps(s.get("repos", [])), common.now()))
-        elif (row["ordinal"], row["title"], row["repos"]) != (
-                s["ordinal"], s.get("title", ""), json.dumps(s.get("repos", []))):
+                    "INSERT INTO steps(id,ordinal,title,repos,depends_on,"
+                    "background,audit,state,detail,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?, 'PENDING','{}',?)",
+                    (s["id"], *vals, common.now()))
+        elif (row["ordinal"], row["title"], row["repos"], row["depends_on"],
+              row["background"], row["audit"]) != vals:
             with conn:
-                conn.execute("UPDATE steps SET ordinal=?, title=?, repos=? WHERE id=?",
-                             (s["ordinal"], s.get("title", ""),
-                              json.dumps(s.get("repos", [])), s["id"]))
-    # a step edited out of the roadmap must not wedge active_step forever
+                conn.execute(
+                    "UPDATE steps SET ordinal=?, title=?, repos=?, depends_on=?,"
+                    " background=?, audit=? WHERE id=?", (*vals, s["id"]))
+    # a step edited out of the roadmap must not wedge the scheduler forever
     for row in conn.execute("SELECT id,state FROM steps").fetchall():
         if row["id"] not in ids and row["state"] not in ("ACCEPTED", "ABORTED"):
             db.transition(conn, ctx, row["id"], "ABORTED", "removed from roadmap.yaml")
@@ -124,6 +184,18 @@ def integration_sha(roadmap, repo_name) -> str:
 
 # ---------- dispatch ----------
 
+def gate(ctx, conn, role, model, new_step=False, background=False) -> bool:
+    """Per-tick dispatch gate (capacity governor). CLI paths without a
+    governor context are not gated."""
+    gov = getattr(ctx, "gov", None)
+    if gov is None:
+        return True
+    if gov["budget"] <= 0:
+        return False
+    return cap.can_dispatch(ctx, conn, gov, role, model,
+                            new_step=new_step, background=background)
+
+
 def dispatch(ctx, conn, step, role, prompt, cwd, to_state, reason,
              task_idx=None, model=None, effort=None, test_cmds=None,
              resume_session=None, lane=None):
@@ -174,8 +246,18 @@ def dispatch(ctx, conn, step, role, prompt, cwd, to_state, reason,
         return run
     run = db.run_by_key(conn, key)
     launch(ctx, conn, run)
+    gov = getattr(ctx, "gov", None)
+    snap = {}
+    if gov:
+        gov["budget"] -= 1
+        gov["active"] = cap.claude_active(conn)
+        u = gov.get("usage") or {}
+        snap = dict(tier=gov["tier"], conf=gov["confidence"],
+                    pressure=gov["pressure"], target=gov["target"],
+                    active=gov["active"], pct5=u.get("pct5"), pct7=u.get("pct7"))
     db.event(conn, ctx, "dispatched", step_id=step["id"], run_id=run["id"],
-             key=key, role=role, model=model, lane=lane, frm=frm, to=to_state)
+             key=key, role=role, model=model, lane=lane, frm=frm, to=to_state,
+             **snap)
     return run
 
 
@@ -205,7 +287,9 @@ def reconcile(ctx, conn):
             continue
         pr = cr.probe(ctx, run)
         if pr["phase"] == "done":
-            finalize(ctx, conn, run, pr["rc"])
+            st = finalize(ctx, conn, run, pr["rc"])
+            if run["role"] == "probe":
+                cap.on_probe_result(ctx, conn, run, st)
         elif pr["phase"] == "lost":
             db.finish_run(conn, ctx, run["id"], "LOST", note="process gone, no exitcode")
             if run["lane"] == "task":
@@ -241,13 +325,36 @@ def finalize(ctx, conn, run, rc):
                   if status != "DONE" else "")
     if run["lane"] == "task":
         cr.delete_task(run["key"])
+    return status
 
 
 # ---------- step state machine ----------
 
-def active_step(conn):
-    return conn.execute(
-        "SELECT * FROM steps WHERE state != 'ACCEPTED' ORDER BY ordinal LIMIT 1").fetchone()
+def steps_all(conn):
+    return conn.execute("SELECT * FROM steps ORDER BY ordinal").fetchall()
+
+
+def live_steps(conn):
+    return [s for s in steps_all(conn) if s["state"] not in ("ACCEPTED", "ABORTED")]
+
+
+def dep_satisfied(conn, dep: str) -> bool:
+    """'step-x' needs ACCEPTED; 'step-x:validated' is satisfied from SOAKING
+    on (validated work exists; the soak result is not a dependency)."""
+    base, _, qual = str(dep).partition(":")
+    row = db.get_step(conn, base)
+    if not row:
+        return False
+    if row["state"] == "ACCEPTED":
+        return True
+    return qual == "validated" and row["state"] == "SOAKING"
+
+
+def step_ready(conn, step) -> bool:
+    if step["state"] != "PENDING":
+        return False
+    return all(dep_satisfied(conn, d)
+               for d in json.loads(step["depends_on"] or "[]"))
 
 
 def set_resume(conn, step, state=None):
@@ -263,6 +370,23 @@ def wait_quota(ctx, conn, step):
     if step["state"] not in common.WAITING_STATES:
         d["resume"] = step["state"]
     db.set_detail(conn, step["id"], d)
+    # a CLI-reported limit is hard capacity information for the whole
+    # scheduler, not just this step. Trust the cached reset time only when
+    # fresh usage numbers corroborate exhaustion; a quota hit with low cached
+    # usage means the cache is stale — back off by the retry interval instead.
+    retry_min = int(ctx.getenv("EC_QUOTA_RETRY_MIN", str(QUOTA_RETRY_MIN)))
+    usage = cap.current_usage(conn)
+    hold = common.iso_in(retry_min * 60)
+    if usage and not usage.get("stale") and usage.get("reset5") \
+            and max(usage.get("pct5") or 0, usage.get("pct7") or 0) >= 90:
+        try:
+            if common.is_past(usage["reset5"]):
+                raise ValueError
+            hold = usage["reset5"]
+        except ValueError:
+            pass
+    db.kv_set(conn, "quota_hold_until", hold)
+    cap.detect(ctx, conn, force=True, trigger="quota")
     if streak > 6:
         # Repeated quota classification is almost certainly a real failure
         # being misread; stop looping and route it to the repair ladder.
@@ -307,6 +431,8 @@ def repair_or_block(ctx, conn, step, findings: str):
 def dispatch_repair(ctx, conn, step, findings, pos):
     roadmap = load_roadmap(ctx)
     scfg = step_cfg(roadmap, step["id"])
+    if not gate(ctx, conn, "repair", route_model(scfg, "repair")[0]):
+        return  # findings persisted; retried next tick
     d = db.step_detail(step)
     resume_session = None
     if pos == 1:  # first repair continues the implementer's session context
@@ -331,6 +457,8 @@ def dispatch_repair(ctx, conn, step, findings, pos):
 def dispatch_diagnostic(ctx, conn, step, findings):
     roadmap = load_roadmap(ctx)
     scfg = step_cfg(roadmap, step["id"])
+    if not gate(ctx, conn, "diagnostic", route_model(scfg, "diagnostic")[0]):
+        return
     d = db.step_detail(step)
     d["diagnosed"] = True
     db.set_detail(conn, step["id"], d)
@@ -374,13 +502,19 @@ def worker_rules(ctx, step) -> str:
         "  EC-Key: <<RUN_KEY>>\n"
         "- Read the repo's CLAUDE.md / PROJECT_STATE.md first and follow its "
         "conventions and token-efficiency rules.\n"
-        "- No secrets in code, commits, or your result JSON.\n")
+        "- No secrets in code, commits, or your result JSON.\n"
+        "- Never touch production stores or live services (discovery.db, "
+        "conversations.db, Chrome/CDP, Telegram): work offline against the "
+        "repo's test seams. Other workers may be active in parallel worktrees.\n")
 
 
 # ---- stage starters ----
 
-def start_planning(ctx, conn, roadmap, step):
+def start_planning(ctx, conn, roadmap, step, new_step=False):
     scfg = step_cfg(roadmap, step["id"])
+    if not gate(ctx, conn, "planner", route_model(scfg, "planner")[0],
+                new_step=new_step, background=bool(step["background"])):
+        return
     repos = json.loads(step["repos"])
     blocks = []
     for r in repos:
@@ -415,8 +549,10 @@ def start_planning(ctx, conn, roadmap, step):
 
 
 def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
-    d = db.step_detail(step)
     scfg = step_cfg(roadmap, step["id"])
+    if not gate(ctx, conn, "implementer", route_model(scfg, "implementer")[0]):
+        return
+    d = db.step_detail(step)
     cycle = d.get("cycle", 0)
     idx = d.get("task_idx", 0) if task_idx is None else task_idx
     plan = common.read_json(Path(step["plan_path"])) if step["plan_path"] else None
@@ -470,6 +606,8 @@ def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
 
 
 def start_testing(ctx, conn, roadmap, step):
+    if not gate(ctx, conn, "test", None):
+        return
     d = db.step_detail(step)
     repo = current_repo(ctx, step)
     cmds = repo_cfg(roadmap, repo)["tests"]
@@ -478,8 +616,10 @@ def start_testing(ctx, conn, roadmap, step):
 
 
 def start_review(ctx, conn, roadmap, step):
-    d = db.step_detail(step)
     scfg = step_cfg(roadmap, step["id"])
+    if not gate(ctx, conn, "reviewer", route_model(scfg, "reviewer")[0]):
+        return
+    d = db.step_detail(step)
     repo = current_repo(ctx, step)
     ws = Path(repo_cfg(roadmap, repo)["workspace"])
     head = gitops.current_sha(Path(d["task_wt"]))
@@ -512,14 +652,31 @@ def last_test_report(ctx, conn, step) -> str:
     return obj.get("report", "(no report)")
 
 
+def repo_integration_busy(conn, ws: Path, exclude_step=None) -> bool:
+    """True while another step's validation run holds this repo's integration
+    checkout. Integration stays serialized per repository even though steps
+    run in parallel (worktrees are per-step; the ws checkout is shared)."""
+    for r in conn.execute(
+            "SELECT step_id, cwd FROM runs WHERE role='test' "
+            "AND status IN ('PREPARED','DISPATCHED')"):
+        if r["step_id"] != exclude_step and r["cwd"] and \
+                Path(r["cwd"]).resolve() == ws.resolve():
+            return True
+    return False
+
+
 def enter_validation(ctx, conn, roadmap, step):
     """Controller-owned promotion: acceptance checks + cherry-pick to
     automation/integration (idempotent via -x provenance), then an independent
-    test run on the integration checkout."""
+    test run on the integration checkout. Serialized per repo."""
     d = db.step_detail(step)
     repo = current_repo(ctx, step)
     rc = repo_cfg(roadmap, repo)
     ws = Path(rc["workspace"])
+    if repo_integration_busy(conn, ws, exclude_step=step["id"]):
+        return  # stay in current state; retried next tick
+    if not gate(ctx, conn, "test", None):
+        return
     head = gitops.current_sha(Path(d["task_wt"]))
     base = d["task_base"]
     ok, findings = vd.git_acceptance(ws, base, head, ctx._secrets)
@@ -642,34 +799,193 @@ def build_handoff(ctx, conn, roadmap, step) -> dict:
     }
 
 
-# ---- the per-tick advance ----
+# ---- final independent audit steps (audit: true in roadmap) ----
 
-def advance(ctx, conn, roadmap):
-    step = active_step(conn)
-    if step is None:
+def start_audit(ctx, conn, roadmap, step, new_step=False):
+    scfg = step_cfg(roadmap, step["id"])
+    model, effort = route_model(scfg, "audit")
+    if not gate(ctx, conn, "audit", model, new_step=new_step):
+        return
+    primary = json.loads(step["repos"])[0]
+    ws = Path(repo_cfg(roadmap, primary)["workspace"])
+    wt = ctx.art / "wt" / f"{step['id']}-audit"
+    if wt.exists():
+        gitops.worktree_remove(ws, wt)
+    gitops.worktree_add_detached(ws, wt, integration_sha(roadmap, primary))
+    blocks = []
+    for r in json.loads(step["repos"]):
+        rc = repo_cfg(roadmap, r)
+        blocks.append(f"- repo '{r}': integration checkout {rc['workspace']} @ "
+                      f"{integration_sha(roadmap, r)[:10]}")
+    handoffs = []
+    for row in conn.execute("SELECT id, handoff_path FROM steps "
+                            "WHERE state='ACCEPTED' ORDER BY ordinal"):
+        if row["handoff_path"] and Path(row["handoff_path"]).exists():
+            handoffs.append(Path(row["handoff_path"]).read_text(encoding="utf-8")[:6000])
+    materials = ("Repositories under audit (read-only worktree of the primary "
+                 "repo is your cwd):\n" + "\n".join(blocks)
+                 + "\n\nAccepted step handoffs:\n" + "\n---\n".join(handoffs))
+    prompt = fill(prompt_template("audit.md"), {
+        "OBJECTIVE": scfg.get("objective", step["title"]),
+        "MATERIALS": materials, "RESULT_PATH": "<<RESULT_PATH>>"})
+    dispatch(ctx, conn, step, "audit", prompt, wt, "REVIEWING",
+             "final independent audit dispatched", model=model, effort=effort)
+    tgm.notify(conn, ctx, f"start:{step['id']}:{db.step_detail(step).get('cycle',0)}",
+               f"engine-control: {step['id']} final audit started ({model})")
+
+
+def on_audit(ctx, conn, roadmap, step, run):
+    d = db.step_detail(step)
+    if run["status"] == "DONE":
+        obj, errs = vd.check_result(Path(run["artifact_dir"]) / "result.json",
+                                    "review.schema.json")
+        if obj and not errs:
+            verdict = obj["verdict"]
+            primary = json.loads(step["repos"])[0]
+            ws = Path(repo_cfg(roadmap, primary)["workspace"])
+            gitops.worktree_remove(ws, ctx.art / "wt" / f"{step['id']}-audit")
+            hp = ctx.art / "handoffs" / f"{step['id']}.json"
+            common.write_atomic(hp, json.dumps({
+                "version": 1, "step_id": step["id"], "accepted_commits": [],
+                "behavior": obj.get("summary", ""), "decisions": [],
+                "interfaces": [], "metrics": {"verdict": verdict},
+                "hypotheses_supported": [], "hypotheses_falsified": [],
+                "failures": [], "uncertainty": "",
+                "verification": "independent audit (fresh context, read-only)",
+                "implications": json.dumps(obj.get("findings", []))[:3000]}, indent=1))
+            with conn:
+                conn.execute("UPDATE steps SET handoff_path=?, active_run_id=NULL "
+                             "WHERE id=?", (str(hp), step["id"]))
+            if verdict == "PASS":
+                db.transition(conn, ctx, step["id"], "ACCEPTED", "audit PASS")
+                tgm.notify(conn, ctx, f"accepted:{step['id']}",
+                           f"engine-control: ✅ {step['id']} audit PASS — {step['title']}")
+            else:
+                goto_blocked(ctx, conn, step, f"final audit {verdict}: "
+                             + json.dumps(obj.get("findings", []))[:400])
+            return
+        note = f"audit artifact invalid: {errs[:3]}"
+    else:
+        note = f"audit run {run['status']}: {run['note']}"
+    tries = d.get("reviewer_tries", 0) + 1
+    d["reviewer_tries"] = tries
+    db.set_detail(conn, step["id"], d)
+    if tries >= REVIEWER_TRIES:
+        goto_blocked(ctx, conn, step, f"audit failed {tries}x: {note[:200]}")
+    else:
+        start_audit(ctx, conn, roadmap, step)
+
+
+# ---- the per-tick advance: DAG scheduler ----
+
+STAGE_ORDER = {"VALIDATING": 0, "REVIEWING": 1, "TESTING": 2, "REPAIRING": 3,
+               "IMPLEMENTING": 4, "PLANNING": 5, "SOAKING": 6}
+
+
+def notify_plan_transition(ctx, conn, view):
+    cur = f"{view.get('tier')}|{view.get('confidence')}"
+    if db.kv_get(conn, "plan_notified") == cur:
+        return
+    db.kv_set(conn, "plan_notified", cur)
+    prev = view.get("prev_tier")
+    label = {"max20": "Max 20x", "max5": "Max 5x", "pro": "Pro",
+             "max_unknown": "Max (exact tier pending)",
+             "unknown": "unknown"}.get(view.get("tier"), view.get("tier"))
+    tgm.notify(conn, ctx, f"plan:{prev}->{view.get('tier')}:{view.get('detected_at')}",
+               f"engine-control: plan detection — {label} "
+               f"({view.get('confidence')}, auto). Concurrency adapts automatically; "
+               "no owner action needed.")
+
+
+def advance_all(ctx, conn, roadmap):
+    live = live_steps(conn)
+    if not live:
         if db.kv_get(conn, "roadmap_started") == "1":
             tgm.notify(conn, ctx, "roadmap:complete",
                        "engine-control: 🎉 roadmap complete — all steps accepted")
         return
+    errs = dag_errors(roadmap)
+    if errs:
+        db.event(conn, ctx, "dag_error", errs=errs[:5])
+        tgm.notify(conn, ctx, "dag:" + errs[0][:60],
+                   "engine-control: ⛔ roadmap DAG invalid — " + "; ".join(errs)[:300])
+        return
+
+    view = cap.detect(ctx, conn)
+    if not cap.auth_ok(view):
+        for s in live:
+            if s["state"] in common.HALT_STATES or s["state"] == "WAITING_AUTH":
+                continue
+            set_resume(conn, s)
+            db.transition(conn, ctx, s["id"], "WAITING_AUTH",
+                          f"auth mode {view.get('auth_mode')} overrides="
+                          f"{view.get('billing_overrides')}")
+        tgm.notify(conn, ctx,
+                   f"auth:{view.get('auth_mode')}:{'|'.join(view.get('billing_overrides') or [])}",
+                   "engine-control: ⚠ Claude auth is not subscription mode "
+                   f"(mode={view.get('auth_mode')}, overrides={view.get('billing_overrides')}). "
+                   "No work is dispatched; automatic recheck continues.")
+        return
+
+    tg_ok = tgm.from_ctx(ctx) is not None or ctx.getenv("EC_ALLOW_NO_TELEGRAM") == "1"
+    if not tg_ok:
+        for s in live:
+            if s["state"] not in ("WAITING_CONFIG",) and s["state"] not in common.HALT_STATES:
+                set_resume(conn, s)
+                db.transition(conn, ctx, s["id"], "WAITING_CONFIG",
+                              "dev telegram credentials missing")
+        ctx.log(tgm.SETUP_HELP)
+        return
+
+    usage = cap.current_usage(conn)
+    weights = crit_weight(roadmap)
+    ready = [s for s in live if step_ready(conn, s)]
+    critical_ready = len([s for s in ready if not s["background"]])
+    gov = cap.governor(ctx, conn, view, usage, critical_ready)
+    gov["budget"] = int(ctx.getenv("EC_DISPATCH_BUDGET", "3"))
+    ctx.gov = gov
+    notify_plan_transition(ctx, conn, view)
+
+    # 1) advance in-flight steps, finishing work first, critical path first
+    active = [s for s in live
+              if s["state"] != "PENDING" and s["state"] not in common.HALT_STATES]
+    active.sort(key=lambda s: (STAGE_ORDER.get(s["state"], 8),
+                               -weights.get(s["id"], 0), s["ordinal"]))
+    for s in active:
+        advance_step(ctx, conn, roadmap, db.get_step(conn, s["id"]))
+
+    # 2) start new READY steps up to the dynamic concurrency target
+    ready.sort(key=lambda s: (1 if s["background"] else 0,
+                              -weights.get(s["id"], 0), s["ordinal"]))
+    for s in ready:
+        if gov["budget"] <= 0:
+            break
+        if s["background"]:
+            bg_active = conn.execute(
+                "SELECT COUNT(*) c FROM steps WHERE background=1 AND state NOT IN "
+                "('PENDING','ACCEPTED','ABORTED','BLOCKED')").fetchone()["c"]
+            if bg_active >= gov["env"]["background"]:
+                continue
+        step = db.get_step(conn, s["id"])
+        if step["audit"]:
+            start_audit(ctx, conn, roadmap, step, new_step=True)
+        else:
+            start_planning(ctx, conn, roadmap, step, new_step=True)
+
+
+def advance_step(ctx, conn, roadmap, step):
     state = step["state"]
     scfg = step_cfg(roadmap, step["id"])
     d = db.step_detail(step)
 
-    if state in common.HALT_STATES:
-        return  # halted; never skip a blocked dependency
-
-    tg_ok = tgm.from_ctx(ctx) is not None or ctx.getenv("EC_ALLOW_NO_TELEGRAM") == "1"
-    if not tg_ok:
-        if state != "WAITING_CONFIG":
-            set_resume(conn, step)
-            db.transition(conn, ctx, step["id"], "WAITING_CONFIG",
-                          "dev telegram credentials missing")
-            ctx.log(tgm.SETUP_HELP)
-        return
-    if state == "WAITING_CONFIG":
-        db.transition(conn, ctx, step["id"], d.get("resume", "PENDING"), "config present")
+    if state in ("WAITING_CONFIG", "WAITING_AUTH"):
+        db.transition(conn, ctx, step["id"], d.get("resume", "PENDING"),
+                      "config/auth present")
         return
     if state == "WAITING_QUOTA":
+        hold = db.kv_get(conn, "quota_hold_until")
+        if hold and not common.is_past(hold):
+            return
         if step["retry_at"] and common.is_past(step["retry_at"]):
             run = db.get_run(conn, step["active_run_id"]) if step["active_run_id"] else None
             redispatch_stage(ctx, conn, roadmap, step, run)  # attempts unchanged
@@ -680,9 +996,7 @@ def advance(ctx, conn, roadmap):
         tgm.notify(conn, ctx, f"recovered:{step['id']}:{common.now()[:16]}",
                    f"engine-control: {step['id']} recovered after interruption")
         return
-
-    if state == "PENDING":
-        start_planning(ctx, conn, roadmap, step)
+    if state == "WAITING_USER":
         return
     if state == "SOAKING":
         if step["soak_until"] and common.is_past(step["soak_until"]):
@@ -713,6 +1027,9 @@ def advance(ctx, conn, roadmap):
         d.pop("quota_streak", None)
         db.set_detail(conn, step["id"], d)
 
+    if state == "REVIEWING" and run["role"] == "audit":
+        on_audit(ctx, conn, roadmap, step, run)
+        return
     handler = {
         "PLANNING": on_planning, "IMPLEMENTING": on_impl_like,
         "REPAIRING": on_impl_like, "TESTING": on_testing,
@@ -727,7 +1044,9 @@ def redispatch_stage(ctx, conn, roadmap, step, run):
                                     "TESTING": "test", "REVIEWING": "reviewer",
                                     "VALIDATING": "test", "REPAIRING": "repair"}.get(step["state"])
     d = db.step_detail(step)
-    if role == "planner":
+    if role == "audit":
+        start_audit(ctx, conn, roadmap, step)
+    elif role == "planner":
         start_planning(ctx, conn, roadmap, step)
     elif role == "implementer":
         start_task_impl(ctx, conn, roadmap, step)
@@ -902,12 +1221,35 @@ def on_validating(ctx, conn, roadmap, step, run):
 
 # ---------- telegram commands ----------
 
+TIER_LABEL = {"max20": "Max 20x", "max5": "Max 5x", "pro": "Pro",
+              "max_unknown": "Max (exact tier pending)", "unknown": "unknown"}
+
+
 def status_text(ctx, conn) -> str:
     lines = []
     started = db.kv_get(conn, "roadmap_started") == "1"
     paused = db.kv_get(conn, "paused") == "1"
+    run_id = db.kv_get(conn, "roadmap_run_id") or "-"
     lines.append(f"engine-control — roadmap {'started' if started else 'NOT started'}"
-                 f"{' [PAUSED]' if paused else ''}")
+                 f"{' [PAUSED]' if paused else ''} (run {run_id})")
+    view = json.loads(db.kv_get(conn, "capacity_state") or "{}")
+    usage = cap.current_usage(conn)
+    ready = [s["id"] for s in live_steps(conn) if step_ready(conn, s)]
+    gov = cap.governor(ctx, conn, view, usage,
+                       len([r for r in ready if not db.get_step(conn, r)["background"]]))
+    mode = "auto" if not gov["override"] else f"override:{gov['override']}"
+    lines.append(f"Plan: {TIER_LABEL.get(gov['tier'], gov['tier'])} "
+                 f"({mode}, {view.get('confidence', '?')}) · auth {view.get('auth_mode', '?')}")
+    if usage:
+        stale = " STALE" if usage.get("stale") else ""
+        lines.append(f"Usage: 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
+                     f" (age {int(usage.get('age_min', 0))}m{stale}, {usage.get('source')})")
+    else:
+        lines.append("Usage: no telemetry yet")
+    lines.append(f"Claude workers: {gov['active']} active · target {gov['target']}"
+                 f" · pressure {gov['pressure']} · pace {gov['pace']}")
+    if ready:
+        lines.append(f"READY: {', '.join(ready)}")
     for s in conn.execute("SELECT * FROM steps ORDER BY ordinal"):
         d = db.step_detail(s)
         pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
@@ -922,10 +1264,22 @@ def status_text(ctx, conn) -> str:
     return "\n".join(lines)
 
 
+def rearm_step(ctx, conn, step) -> str:
+    d = {"cycle": db.step_detail(step).get("cycle", 0) + 1}
+    db.set_detail(conn, step["id"], d)
+    with conn:
+        conn.execute("UPDATE steps SET active_run_id=NULL, plan_path=NULL WHERE id=?",
+                     (step["id"],))
+    db.transition(conn, ctx, step["id"], "PENDING", "/retry — fresh cycle")
+    return f"{step['id']} re-armed (cycle {d['cycle']})"
+
+
 def handle_commands(ctx, conn, tg, cmds):
     for c in cmds:
-        name = c.split()[0].split("@")[0]
-        db.event(conn, ctx, "tg_command", cmd=name)
+        parts = c.split()
+        name = parts[0].split("@")[0]
+        arg = parts[1] if len(parts) > 1 else None
+        db.event(conn, ctx, "tg_command", cmd=name, arg=arg)
         if name == "/status":
             tg.send(status_text(ctx, conn))
         elif name == "/pause":
@@ -933,29 +1287,54 @@ def handle_commands(ctx, conn, tg, cmds):
             tg.send("engine-control: paused (running workers finish; no new dispatch)")
         elif name == "/resume":
             db.kv_set(conn, "paused", "0")
-            step = active_step(conn)
-            if step and step["state"] == "WAITING_USER":
-                db.transition(conn, ctx, step["id"],
-                              db.step_detail(step).get("resume", "PENDING"), "/resume")
+            for step in live_steps(conn):
+                if step["state"] == "WAITING_USER":
+                    db.transition(conn, ctx, step["id"],
+                                  db.step_detail(step).get("resume", "PENDING"), "/resume")
             tg.send("engine-control: resumed")
         elif name == "/retry":
-            step = active_step(conn)
-            if step and step["state"] in common.HALT_STATES:
-                d = db.step_detail(step)
-                d = {"cycle": d.get("cycle", 0) + 1}
-                db.set_detail(conn, step["id"], d)
-                with conn:
-                    conn.execute("UPDATE steps SET active_run_id=NULL, plan_path=NULL WHERE id=?",
-                                 (step["id"],))
-                db.transition(conn, ctx, step["id"], "PENDING", "/retry — fresh cycle")
-                tg.send(f"engine-control: {step['id']} re-armed (cycle {d['cycle']})")
+            halted = [s for s in steps_all(conn) if s["state"] in common.HALT_STATES
+                      and (arg is None or s["id"] == arg)]
+            if halted:
+                tg.send("engine-control: " + "; ".join(
+                    rearm_step(ctx, conn, s) for s in halted))
             else:
-                tg.send("engine-control: /retry only applies to a BLOCKED/ABORTED step")
+                tg.send("engine-control: no BLOCKED/ABORTED step"
+                        + (f" named {arg}" if arg else "") + " to retry")
         elif name == "/abort":
-            step = active_step(conn)
-            if step:
-                db.transition(conn, ctx, step["id"], "ABORTED", "/abort")
-                tg.send(f"engine-control: {step['id']} aborted; roadmap halted")
+            targets = [s for s in live_steps(conn)
+                       if s["state"] not in common.HALT_STATES
+                       and (arg is None or s["id"] == arg)]
+            if arg is None and len(targets) > 1:
+                tg.send("engine-control: several steps active — use /abort <step-id>: "
+                        + ", ".join(s["id"] for s in targets))
+            elif targets:
+                for s in targets:
+                    db.transition(conn, ctx, s["id"], "ABORTED", "/abort")
+                tg.send("engine-control: aborted " + ", ".join(s["id"] for s in targets)
+                        + " (dependents will not start)")
+            else:
+                tg.send("engine-control: nothing to abort" + (f" ({arg})" if arg else ""))
+        elif name == "/profile":
+            if arg in (None, "auto"):
+                db.kv_set(conn, "plan_override", "")
+                tg.send("engine-control: plan detection AUTO (override cleared)")
+            elif arg in cap.ENVELOPES:
+                db.kv_set(conn, "plan_override", arg)
+                tg.send(f"engine-control: plan OVERRIDE {arg} (debug only — "
+                        "/profile auto to return to automatic detection)")
+            else:
+                tg.send(f"engine-control: unknown profile '{arg}' "
+                        f"(auto|{'|'.join(sorted(cap.ENVELOPES))})")
+        elif name == "/pace":
+            if arg in (None, "auto"):
+                db.kv_set(conn, "pace", "auto")
+                tg.send("engine-control: pace AUTO")
+            elif arg in ("economy", "balanced", "sprint"):
+                db.kv_set(conn, "pace", arg)
+                tg.send(f"engine-control: pace {arg}")
+            else:
+                tg.send("engine-control: /pace auto|economy|balanced|sprint")
         elif name == "/log":
             rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
             out = "\n".join(f"{r['ts'][11:19]} {r['kind']} {r['step_id'] or ''} "
@@ -993,8 +1372,10 @@ def tick(ctx) -> int:
             handle_commands(ctx, conn, tg, cmds)
         try:
             reconcile(ctx, conn)
+            cap.ingest_telemetry(ctx, conn)
+            backup_state(ctx, conn)
             if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
-                advance(ctx, conn, roadmap)
+                advance_all(ctx, conn, roadmap)
             if db.kv_get(conn, "orch_err_streak", "0") != "0":
                 db.kv_set(conn, "orch_err_streak", "0")
         except Exception as e:
@@ -1010,11 +1391,14 @@ def tick(ctx) -> int:
             if streak in (1, 5):
                 tgm.notify(conn, ctx, f"orch-error:{episode}:{streak}",
                            f"engine-control: orchestration error x{streak}: {e!r:.200}")
-            if streak >= 5:
-                step = active_step(conn)
-                if step and step["state"] not in common.HALT_STATES:
-                    goto_blocked(ctx, conn, step,
-                                 f"persistent controller error: {e!r}"[:300])
+            if streak >= 8:
+                # never block a healthy step over a controller bug: with the
+                # DAG scheduler the safe containment is pausing dispatch
+                if db.kv_get(conn, "paused") != "1":
+                    db.kv_set(conn, "paused", "1")
+                    tgm.notify(conn, ctx, f"orch-pause:{episode}",
+                               "engine-control: persistent controller error — dispatch "
+                               "PAUSED (running workers finish). /resume after repair.")
         tgm.flush(ctx, conn, tg)
         conn.close()
         return 0
@@ -1022,9 +1406,92 @@ def tick(ctx) -> int:
         common.release_lock(lock)
 
 
+def backup_state(ctx, conn):
+    """Daily durable checkpoint of state.db (WAL-safe via the backup API)."""
+    today = common.now()[:10]
+    if db.kv_get(conn, "last_backup") == today:
+        return
+    db.kv_set(conn, "last_backup", today)
+    import sqlite3
+    bdir = ctx.root / "backups"
+    bdir.mkdir(exist_ok=True)
+    dest = sqlite3.connect(bdir / f"state-{today}.db")
+    with dest:
+        conn.backup(dest)
+    dest.close()
+    keep = sorted(bdir.glob("state-*.db"))
+    for old in keep[:-7]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 # ---------- CLI ----------
 
 TICK_TASK = "engine-control-tick"
+
+
+def cmd_start(ctx) -> int:
+    """Launch (or re-arm) the autonomous roadmap. Verifies the §48 launch
+    preconditions, persists a stable run id BEFORE any dispatch, and leaves
+    everything else to the scheduled tick."""
+    import subprocess
+    import uuid as _uuid
+    conn = cmd_init(ctx)
+    roadmap = load_roadmap(ctx)
+    errs = dag_errors(roadmap)
+    if errs:
+        print("REFUSED: roadmap DAG invalid: " + "; ".join(errs))
+        return 1
+    view = cap.detect(ctx, conn, force=True, trigger="start")
+    if not cap.auth_ok(view):
+        print(f"REFUSED: Claude auth is not subscription mode "
+              f"(mode={view.get('auth_mode')}, overrides={view.get('billing_overrides')})")
+        return 1
+    q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK, "/fo", "csv", "/nh"],
+                       capture_output=True, text=True)
+    if q.returncode != 0:
+        print("tick task missing — installing")
+        cmd_install_task(ctx)
+    elif "Disabled" in q.stdout:
+        subprocess.run(["schtasks", "/change", "/tn", TICK_TASK, "/enable"],
+                       capture_output=True, text=True)
+        print("tick task re-enabled")
+    if db.kv_get(conn, "roadmap_started") == "1":
+        print(f"roadmap already started (run {db.kv_get(conn, 'roadmap_run_id')}); "
+              "no duplicate run created")
+        return 0
+    cap.ingest_telemetry(ctx, conn)
+    backup_state(ctx, conn)
+    run_id = f"run-{common.now()[:10]}-{_uuid.uuid4().hex[:8]}"
+    db.kv_set(conn, "roadmap_run_id", run_id)
+    db.kv_set(conn, "paused", "0")
+    db.kv_set(conn, "pace", db.kv_get(conn, "pace", "auto"))
+    db.kv_set(conn, "roadmap_started", "1")
+    db.event(conn, ctx, "roadmap_started", run_id=run_id, tier=view.get("tier"),
+             confidence=view.get("confidence"))
+    usage = cap.current_usage(conn)
+    ready = [s for s in live_steps(conn) if step_ready(conn, s)]
+    gov = cap.governor(ctx, conn, view, usage,
+                       len([s for s in ready if not s["background"]]))
+    label = TIER_LABEL.get(gov["tier"], gov["tier"])
+    ulines = (f"Usage: 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
+              if usage else "Usage: telemetry pending")
+    branches = "\n".join(f"• {s['id']} — {s['title']}" for s in ready[:4])
+    tgm.notify(conn, ctx, f"roadmap:started:{run_id}",
+               "🚀 AUTONOMOUS ROADMAP STARTED\n"
+               f"Run: {run_id}\n"
+               f"Plan: {label} ({view.get('confidence')}, auto-detected)\n"
+               f"{ulines}\n"
+               f"Scheduler: AUTO · Claude target now: {gov['target']}\n"
+               f"Roadmap: {len(roadmap['steps'])} steps (dependency DAG)\n"
+               f"First parallel branches:\n{branches}\n"
+               "Background recovery: enabled\nOwner action: none")
+    print(f"roadmap started (run {run_id}); the scheduled tick drives it from here")
+    print(f"plan: {label} ({view.get('confidence')}) · target {gov['target']} "
+          f"· ready: {[s['id'] for s in ready]}")
+    return 0
 
 
 def cmd_install_task(ctx):
@@ -1070,6 +1537,27 @@ def cmd_doctor(ctx):
               "Workers strip it, but remove it from the machine env.")
     else:
         print("[ok] no ANTHROPIC_API_KEY in environment (subscription auth)")
+    try:
+        conn0 = db.connect(ctx)
+        view = cap.detect(ctx, conn0, force=True, trigger="doctor")
+        cap.ingest_telemetry(ctx, conn0)
+        usage = cap.current_usage(conn0)
+        mark = "[ok]" if cap.auth_ok(view) else "[FAIL]"
+        if not cap.auth_ok(view):
+            bad = 1
+        print(f"{mark} plan detection: tier={view.get('tier')} "
+              f"confidence={view.get('confidence')} auth={view.get('auth_mode')}"
+              + (f" overrides={view.get('billing_overrides')}"
+                 if view.get("billing_overrides") else ""))
+        if usage:
+            print(f"[ok] usage telemetry: 5h {usage.get('pct5')}% · "
+                  f"7d {usage.get('pct7')}% (age {int(usage.get('age_min', 0))}m)")
+        else:
+            print("[..] usage telemetry: none yet (populates after first session)")
+        conn0.close()
+    except Exception as e:
+        print(f"[FAIL] plan detection: {e!r:.150}")
+        bad = 1
     print("[ok] telegram configured" if tgm.from_ctx(ctx)
           else "[WAITING_CONFIG] dev telegram not configured:\n" + tgm.SETUP_HELP)
     q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK], capture_output=True, text=True)
@@ -1110,14 +1598,7 @@ def main(argv=None):
         print("workspace initialized")
         return 0
     if args.cmd == "start":
-        conn = cmd_init(ctx)
-        db.kv_set(conn, "roadmap_started", "1")
-        db.kv_set(conn, "paused", "0")
-        tgm.notify(conn, ctx, "roadmap:started",
-                   "engine-control: roadmap started — step 1 begins on the next tick")
-        db.event(conn, ctx, "roadmap_started")
-        print("roadmap started; the scheduled tick drives it from here")
-        return 0
+        return cmd_start(ctx)
     if args.cmd == "doctor":
         return cmd_doctor(ctx)
     if args.cmd == "install-task":

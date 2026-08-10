@@ -71,13 +71,23 @@ ROLES = {
                         tools=["Read", "Grep", "Glob", "Write",
                                "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)"]),
     "test":        dict(model=None, effort=None, pm=None, deadline_min=45, tools=[]),
+    # capacity refresh probe: cheapest model, no tools, no repo context
+    "probe":       dict(model="haiku", effort=None, pm=None, deadline_min=8, tools=None),
 }
 
-MODEL_IDS = {"sonnet": "sonnet", "opus": "opus", "fable": "claude-fable-5"}
+MODEL_IDS = {"sonnet": "sonnet", "opus": "opus", "fable": "claude-fable-5",
+             "haiku": "haiku"}
 
-# Accidental API billing must never happen: strip billing env from workers.
+# Accidental API/third-party billing must never happen: strip billing and
+# provider-override env from workers (subscription OAuth only). Nesting vars
+# are stripped too so a worker behaves identically whether its spawner was
+# the scheduled tick or an interactive Claude session.
 BILLING_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY",
-               "ANTHROPIC_BASE_URL"]
+               "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+               "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+               "AWS_BEARER_TOKEN_BEDROCK",
+               "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+               "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID"]
 
 QUOTA_RE = re.compile(
     r"(usage limit|rate.?limit|limit (?:reached|will reset)|out of (?:usage|quota)"
@@ -128,6 +138,24 @@ def resolve_claude(ctx) -> str | None:
     return shutil.which(exe)
 
 
+def ensure_automation_settings(ctx) -> Path:
+    """Per-session settings for AUTOMATION workers only, passed via
+    --settings. Combined with `--setting-sources project`, worker sessions
+    never load (and never modify) the owner's user-level Claude settings —
+    no owner hooks fire, no owner statusline changes, and the automation
+    statusline feeds utilization telemetry back to the controller."""
+    p = ctx.root / "automation-settings.json"
+    cap = common.CODE_DIR / "telemetry_capture.py"
+    want = {
+        "statusLine": {"type": "command",
+                       "command": f'"{PYTHON}" "{cap}"',
+                       "padding": 0},
+    }
+    if common.read_json(p) != want:
+        common.write_atomic(p, json.dumps(want, indent=1))
+    return p
+
+
 def build_job(ctx: common.Ctx, key: str, role: str, prompt_text: str, cwd: str,
               model: str | None, effort: str | None, resume_session: str | None = None,
               deadline_min: int | None = None, test_cmds: list[str] | None = None) -> Path:
@@ -166,7 +194,9 @@ def build_job(ctx: common.Ctx, key: str, role: str, prompt_text: str, cwd: str,
             argv = [*prefix, claude, "-p", "--output-format", "json",
                     "--model", MODEL_IDS.get(model, model),
                     "--session-id", common.session_uuid(key),
-                    "--add-dir", str(rd)]
+                    "--add-dir", str(rd),
+                    "--setting-sources", "project",
+                    "--settings", str(ensure_automation_settings(ctx))]
             if effort:
                 argv += ["--effort", effort]
             if spec["pm"]:
@@ -175,6 +205,8 @@ def build_job(ctx: common.Ctx, key: str, role: str, prompt_text: str, cwd: str,
                 argv += ["--resume", resume_session, "--fork-session"]
             if spec["tools"]:
                 argv += ["--allowedTools"] + spec["tools"]
+            elif spec["tools"] is None:
+                argv += ["--tools", ""]  # probe: no tools at all
             stdin = "prompt.md"
 
     job = {
@@ -183,6 +215,7 @@ def build_job(ctx: common.Ctx, key: str, role: str, prompt_text: str, cwd: str,
         "env_set": {"EC_ROLE": role, "EC_KEY": key,
                     "EC_PROMPT": str(rd / "prompt.md"),
                     "EC_RESULT": str(result_path), "EC_CWD": cwd,
+                    "EC_TELEMETRY_DIR": str(ctx.root / "telemetry" / "sessions"),
                     **{k: ctx.getenv(k) for k in
                        ("EC_STUB_SCRIPT", "EC_STUB_LOG", "EC_STUB_HANG")
                        if ctx.getenv(k)}},
@@ -215,13 +248,22 @@ def spawn(ctx: common.Ctx, key: str, lane: str) -> dict:
         # neutralizes a later trigger fire. en-US time format (machine-local tool).
         st = (datetime.now() + timedelta(hours=12))
         cmd = f'"{PYTHON}" "{shim}" "{rd}"'
+        # schtasks hard-fails /tr >260 chars and SILENTLY never runs commands
+        # just under that (measured: 240 ok, 260 created-but-never-ran).
+        if len(cmd) > 235:
+            raise RuntimeError(
+                f"task-lane command too long for schtasks ({len(cmd)} chars); "
+                "shorten EC_ROOT/artifact paths or use EC_LANE=direct")
         cr = subprocess.run(
             ["schtasks", "/create", "/tn", tn, "/sc", "once",
              "/st", st.strftime("%H:%M"), "/sd", st.strftime("%m/%d/%Y"),
              "/f", "/tr", cmd], capture_output=True, text=True)
         if cr.returncode != 0:
             raise RuntimeError(f"schtasks create failed: {cr.stderr.strip()[:300]}")
-        subprocess.run(["schtasks", "/run", "/tn", tn], capture_output=True, text=True)
+        rr = subprocess.run(["schtasks", "/run", "/tn", tn],
+                            capture_output=True, text=True)
+        if rr.returncode != 0:
+            raise RuntimeError(f"schtasks run failed: {rr.stderr.strip()[:300]}")
         return {"lane": "task", "task": tn, "session": common.session_uuid(key)}
     # direct: detached; survives tick exit (ticks run under Task Scheduler,
     # not SSH, so workers are not SSH-session children).
