@@ -40,7 +40,7 @@ TASKS = {
 COLLECTORS = ("stocks", "web", "youtube")
 
 HELP = (
-    "/news — appliance status (tasks, health, pending)\n"
+    "/news (or /news status) — appliance health, tasks, pending sends\n"
     "/news run stocks|web|youtube|all — collect now\n"
     "/news run digest — send pending discovery items now\n"
     "/news config — current settings + notify bars\n"
@@ -48,7 +48,8 @@ HELP = (
     "/news set digest_max N          (items per digest)\n"
     "/news set stocks|web|youtube <every: 45m|2h|1h30m>\n"
     "/news set max_scores N          (LLM calls per cycle)\n"
-    "/news set bar <interest-key> <0.50-0.99>  (lower = more items)"
+    "/news set bar <interest-key> <0.50-0.99>  (lower = more items)\n"
+    "/news help — this cheat sheet"
 )
 
 
@@ -282,7 +283,7 @@ def _set_bar(ctx, interest_key: str, value: str) -> str:
 
 def command(ctx, sub: str, rest) -> str:
     try:
-        if sub in ("", "status"):
+        if sub == "" or sub == "status":
             return status(ctx)
         if sub == "run":
             return run(ctx, rest[0] if rest else "")

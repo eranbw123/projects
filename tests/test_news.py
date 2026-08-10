@@ -1,10 +1,13 @@
 """Unit tests for newsops (/news): whitelisted config mutation with backups,
-manual runs via schtasks, command routing that never raises. Fully offline —
-both subprocess boundaries (_run/_app) are stubbed."""
+manual runs via schtasks, command routing that never raises, and /help
+coverage enforcement. Fully offline — both subprocess boundaries (_run/_app)
+are stubbed."""
 import json
+import re
 import shutil
 import sys
 import unittest
+from pathlib import Path
 
 from harness import CODE, mkroot
 
@@ -171,6 +174,34 @@ class TestRunAndRouting(NewsBase):
         out = newsops.status(self.ctx)
         self.assertIn("collect-stocks: Ready · last rc 0 · next 10:44", out)
         self.assertIn("⚠ digest: not installed", out)
+
+
+class TestHelpCoverage(unittest.TestCase):
+    """Help must never drift from the actual routing: these tests parse the
+    real dispatch code, so adding a command without updating /help (or the
+    telegram COMMANDS whitelist, or newsops.HELP) fails the suite."""
+
+    def test_every_routed_command_is_in_help_and_whitelist(self):
+        import control
+        import telegram as tgm
+        src = Path(control.__file__).read_text(encoding="utf-8")
+        body = re.search(r"def handle_commands\(.*?(?=\ndef )", src, re.S).group(0)
+        routed = set(re.findall(r'name == "(/\w+)"', body))
+        self.assertGreaterEqual(len(routed), 12, "routing parse broke")
+        help_out = control.help_text()
+        for cmd in sorted(routed):
+            self.assertIn(cmd, help_out, f"{cmd} is routed but missing from /help")
+            self.assertIn(cmd, tgm.COMMANDS,
+                          f"{cmd} is routed but missing from telegram.COMMANDS")
+
+    def test_every_news_subcommand_is_in_the_cheat_sheet(self):
+        csrc = re.search(r"def command\(.*", Path(newsops.__file__).read_text(
+            encoding="utf-8"), re.S).group(0)
+        subs = set(re.findall(r'sub == "(\w+)"', csrc))
+        self.assertGreaterEqual(len(subs), 4, "subcommand parse broke")
+        for sub in sorted(subs):
+            self.assertIn(f"/news {sub}", newsops.HELP,
+                          f"/news {sub} is routed but missing from the cheat sheet")
 
 
 if __name__ == "__main__":

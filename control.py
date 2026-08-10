@@ -1986,6 +1986,8 @@ def rearm_step(ctx, conn, step) -> str:
 
 
 def help_text() -> str:
+    # tests/test_news.py TestHelpCoverage pins this text to the actual command
+    # routing: adding a command without listing it here fails the suite.
     return (
         "engine-control commands:\n"
         "/status — roadmap, plan, usage, every step\n"
@@ -1999,8 +2001,9 @@ def help_text() -> str:
         "/log — recent engine events\n"
         f"/profile auto|{'|'.join(sorted(cap.ENVELOPES))} — plan override (debug)\n"
         "/pace auto|economy|balanced|sprint — dispatch pace\n"
-        "/news — the deployed discovery appliance: status, manual runs, "
-        "settings (/news help)")
+        "/help — this list (also /start)\n"
+        "\nnews appliance (the deployed product — delivery stays on the news "
+        "bot):\n" + newsops.HELP)
 
 
 def _fmt_event(r) -> str:
