@@ -4,6 +4,9 @@ state.db-wal
 state.db-shm
 artifacts/
 logs/
+telemetry/
+backups/
+automation-settings.json
 tick.lock
 __pycache__/
 *.pyc

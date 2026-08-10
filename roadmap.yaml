@@ -25,11 +25,19 @@ repos:
     tests:
       - python -m unittest discover -p "test_*.py"
 
+# depends_on entries name steps that must be ACCEPTED first; the qualifier
+# ':validated' is satisfied once the dependency reaches SOAKING (its work is
+# integrated and validated; only the soak observation remains). Steps without
+# dependencies run in parallel up to the detected capacity envelope.
+# background: true marks low-priority evidence lanes that must never steal a
+# critical-path slot. audit: true dispatches the independent audit role
+# instead of the plan/implement pipeline.
 steps:
   - id: step-01
     ordinal: 1
     title: Internet as an appliance
     repos: [internet]
+    depends_on: []
     soak_minutes: 1440
     objective: |
       Make production discovery continuously operational without dependence on
@@ -48,6 +56,7 @@ steps:
     ordinal: 2
     title: ai -> internet personal state contract
     repos: [ai, internet]
+    depends_on: []
     objective: |
       Create a stable versioned derived-state contract from the ai repository
       to internet. internet must never couple to raw conversations.db — it
@@ -64,6 +73,7 @@ steps:
     ordinal: 3
     title: Knowledge state
     repos: [ai]
+    depends_on: [step-02]
     experiment: true
     objective: |
       Create a useful representation of what the owner already knows/believes,
@@ -81,6 +91,7 @@ steps:
     ordinal: 4
     title: Weak behavioral labels
     repos: [ai]
+    depends_on: [step-02]
     experiment: true
     objective: |
       Extract noisy-but-useful supervision from conversation behavior:
@@ -96,6 +107,7 @@ steps:
     ordinal: 5
     title: Future-self experiment
     repos: [ai, internet]
+    depends_on: [step-03, step-04]
     experiment: true
     models: {planner: fable}
     objective: |
@@ -113,6 +125,7 @@ steps:
     ordinal: 6
     title: High-information teaching UI
     repos: [internet]
+    depends_on: [step-05]
     objective: |
       Build the smallest useful interface for explicit teaching/labeling,
       prioritizing uncertain/high-information cases rather than indiscriminate
@@ -127,6 +140,7 @@ steps:
     ordinal: 7
     title: Dynamic interests
     repos: [internet]
+    depends_on: [step-05]
     objective: |
       Layered interest state: OWNER / INFERRED / EMERGING / EXPLORATORY.
       Owner-written interests remain authoritative and are never silently
@@ -141,6 +155,7 @@ steps:
     ordinal: 8
     title: Close the product loop
     repos: [ai, internet]
+    depends_on: [step-01, step-06, step-07]
     models: {planner: fable}
     objective: |
       Connect conversation-derived state -> internet discovery -> feedback and
@@ -152,34 +167,77 @@ steps:
       Loop demonstrated on real data; a leakage test proves a synthetic
       injected preference does not self-amplify; provenance chain queryable.
 
-  - id: step-09
+  - id: step-09a
     ordinal: 9
-    title: Information-frontier connectors
+    title: Connector evidence collection (background lane)
     repos: [internet]
+    depends_on: ['step-01:validated']
+    background: true
     experiment: true
     objective: |
-      Do not hard-code a connector choice. Measure which currently-missing
-      source is expected to add the highest marginal unique information value;
-      run bounded connector experiments before production promotion.
-      Incorporate existing engine-lab evidence (X prompt-lab conclusions,
-      proposal ledger) as evidence, not immutable truth.
+      LOW-RISK, read-only connector reconnaissance collected EARLY so the
+      final step-09 decision does not pay all evidence latency at once:
+      source availability checks, bounded candidate retrieval samples,
+      marginal unique-item yield vs existing sources, overlap analysis,
+      failure/rate-limit behavior, candidate relevance distributions.
+      Strictly no production mutation: no collector registration, no config
+      change, no promotion, no large external API spend. Results must be
+      persisted with provenance/timestamps so later evaluation can use only
+      evidence that existed at the appropriate time. Incorporate existing
+      engine-lab evidence (X prompt-lab conclusions, proposal ledger) as
+      evidence, not immutable truth.
+    acceptance: |
+      Evidence artifacts persisted and reproducible; provably zero production
+      config/DB mutation (diff shows no collector/production changes beyond
+      additive evidence artifacts + read-only tooling); external spend within
+      the pre-registered bound recorded in the plan.
+
+  - id: step-09
+    ordinal: 10
+    title: Information-frontier connector decision
+    repos: [internet]
+    depends_on: [step-08, step-09a]
+    experiment: true
+    objective: |
+      Do not hard-code a connector choice. Using step-09a evidence plus the
+      personalization/closed-loop evidence from step-08, measure which
+      currently-missing source adds the highest marginal unique information
+      value; run bounded connector experiments before production promotion.
     acceptance: |
       Candidate connectors compared on pre-registered marginal-value metrics;
       only the winner (if any) promoted, behind the standard collector
       interface; losers recorded with evidence in the handoff.
 
   - id: step-10
-    ordinal: 10
-    title: Exploration engine + final whole-system audit
+    ordinal: 11
+    title: Exploration engine
     repos: [internet]
+    depends_on: [step-08]
     models: {planner: fable}
     objective: |
       Separate exploitation of known interests from exploration of adjacent
       unknown interests: distinct budgets, thresholds, metrics and failure
-      containment. After implementation, an independent fable audit covers
-      both the product architecture and the development-control architecture
-      (audit role, fresh context, read-only).
+      containment. May run concurrently with the step-09 connector decision
+      when the planner confirms their interfaces do not conflict; the final
+      whole-system audit is step-11.
     acceptance: |
       Exploration budget provably capped and isolated from exploitation
-      quality metrics; final independent fable audit returns PASS with no
-      critical/major findings.
+      quality metrics; canonical suites green at integration.
+
+  - id: step-11
+    ordinal: 12
+    title: Final whole-system audit
+    repos: [internet]
+    depends_on: [step-09, step-10]
+    audit: true
+    models: {audit: fable}
+    objective: |
+      Independent high-capability audit (fresh context, read-only) of both
+      the product architecture (discovery, personal/knowledge state, teaching
+      loop, dynamic interests, exploration engine, connectors) and the
+      development-control architecture that produced it. Verifies roadmap
+      acceptance criteria against code and artifacts, not claims. Privacy
+      boundary: derived/aggregate state only — never raw conversation bodies.
+    acceptance: |
+      Audit verdict PASS with no critical/major findings; findings and
+      implications recorded in the handoff.

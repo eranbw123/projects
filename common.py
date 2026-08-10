@@ -22,12 +22,13 @@ CODE_DIR = Path(__file__).resolve().parent
 STEP_STATES = {
     "PENDING", "PLANNING", "IMPLEMENTING", "TESTING", "REVIEWING",
     "REPAIRING", "VALIDATING", "SOAKING", "ACCEPTED",
-    "WAITING_CONFIG", "WAITING_USER", "WAITING_QUOTA",
+    "WAITING_CONFIG", "WAITING_USER", "WAITING_QUOTA", "WAITING_AUTH",
     "INTERRUPTED", "BLOCKED", "ABORTED",
 }
 # States where the step is waiting on something external; they never consume
 # an implementation attempt.
-WAITING_STATES = {"WAITING_CONFIG", "WAITING_USER", "WAITING_QUOTA", "INTERRUPTED"}
+WAITING_STATES = {"WAITING_CONFIG", "WAITING_USER", "WAITING_QUOTA",
+                  "WAITING_AUTH", "INTERRUPTED"}
 HALT_STATES = {"BLOCKED", "ABORTED"}
 
 SECRET_KEY_RE = re.compile(r"(TOKEN|SECRET|KEY|PASSWORD|PASSWD)", re.I)
@@ -53,6 +54,14 @@ def iso_in(seconds: float) -> str:
 
 def is_past(iso: str) -> bool:
     return datetime.now(timezone.utc) >= parse_iso(iso)
+
+
+def local_str(iso: str, fmt: str = "%H:%M") -> str:
+    """UTC-stored timestamp -> machine-local display (owner-facing text)."""
+    try:
+        return parse_iso(iso).astimezone().strftime(fmt)
+    except (ValueError, TypeError):
+        return str(iso or "")
 
 
 def load_env_file(path: Path) -> dict:

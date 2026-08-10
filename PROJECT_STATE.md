@@ -1,81 +1,96 @@
 # PROJECT_STATE.md — `engine-control`
 
-Updated 2026-08-10 (Step 0 complete, post-audit repairs). Imported by
-CLAUDE.md. Current state only.
+Updated 2026-08-10 (commissioning: DAG scheduler + auto plan detection +
+live telemetry). Imported by CLAUDE.md. Current state only.
 
 ## Implemented
-Tick-based orchestrator (Scheduled Task `engine-control-tick`, 1/min):
-`control.py` (state machine + CLI) · `db.py` (SQLite WAL, append-only events)
-· `claude_runner.py` (job contract, direct/task lanes, probe/adopt/kill,
-quota + fable guards) · `worker_shim.py` (detached supervisor; exitcode.txt =
-completion marker; idempotent vs double-fire) · `gitops.py` (assert_safe
-mechanical rails incl. invocation-level classification, worktrees,
-cherry-pick -x promotion) · `telegram.py` (dev-bot commands + keyed idempotent
-notifications) · `validators.py` (canonical repo tests via `cmd /d /c`,
-schema/secret/forbidden checks).
+Tick orchestrator (Scheduled Task `engine-control-tick`, 1/min): `control.py`
+(DAG scheduler + step state machine + CLI) · `capacity.py` (plan detection,
+utilization telemetry, envelopes, governor) · `db.py` (SQLite WAL; + steps
+depends_on/background/audit cols, telemetry, plan_detections) ·
+`claude_runner.py` (job contract, direct/task lanes, probe/adopt/kill, quota
++ fable guards, automation settings) · `telemetry_capture.py` (statusline →
+per-session JSON) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
+`validators.py`.
 
-States: PENDING→PLANNING→IMPLEMENTING→TESTING→REVIEWING→VALIDATING→
-(SOAKING)→ACCEPTED, plus WAITING_CONFIG/USER/QUOTA, INTERRUPTED, BLOCKED,
-ABORTED. Ladder: impl→repair1(resume)→repair2(fresh)→diagnostic→final→
-BLOCKED; waits/LOST never consume rungs. Dispatch is atomic (run row +
-active_run_id + transition in one txn), keys deterministic
-(`step.cCYCLE.tTASK.role.seq` → uuid5 session id); key collision on replay =
-adopt, never duplicate. Multi-task steps track `done_tasks` keyed by the
-validation run's own task_idx — task advancement is re-entrant (audit F1).
-Handoffs: `artifacts/handoffs/<step>.json` (schema v1) — planners consume
-these, not transcripts.
+## Scheduler (commissioned 2026-08-10)
+Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied
+from SOAKING; `background: true` lanes never take critical slots; `audit:
+true` steps dispatch the fable audit role directly). Per tick: reconcile →
+telemetry ingest → capacity detect → advance in-flight steps
+(finishing-first: VALIDATING>REVIEWING>TESTING>REPAIRING>IMPLEMENTING>
+PLANNING, critical-path weight next) → start READY steps while
+claude_active < dynamic target (≤3 dispatches/tick). Every Claude dispatch
+passes `capacity.can_dispatch` (pressure class, target, fable=1/opus caps,
+local-test cap). Integration stays serialized per repo
+(`repo_integration_busy` defers enter_validation; deferral is idempotent —
+DONE runs are reprocessed next tick). Stale parallel work: base recorded per
+task; ancestry + cherry-pick conflict → REPAIR, never reset. A BLOCKED step
+blocks only its dependents; /retry [step] re-arms, /abort [step] prunes.
+Controller error streak ≥8 → auto-pause + notify (never blocks a healthy step).
 
-## Fable audit (2026-08-10) → REPAIR → repaired, matrix re-run green
-Fixed: F1 crash-atomic task advancement · F2 assert_safe invocation-level
-classification (worktree/branch/remote/config), -C/--git-dir ban, +refspec
-ban, cwd required for mutations · F3 quota = CLI-reported only
-(`cli_quota`), streak cap 6 → repair ladder · F4 orchestration errors
-notify at x1/x5 and BLOCK the step at x5 (no silent loops) · F5 fable guard
-matches conversation BODY shapes, not store names · F6 pre-existing
-CHERRY_PICK_HEAD aborted before integrating · F7 pid probe/kill require a
-python image (PID-reuse guard) · F8 workers get specific git verbs (no
-push/branch/remote/worktree/config — permission-layer, not prose) · F9
-commit rows recorded idempotently in both integrate branches · F11
-sync_steps upserts; steps removed from roadmap → ABORTED, never wedge.
+## Capacity (all AUTO; no owner action on plan changes)
+plan_mode auto (kv plan_override = debug escape hatch, /profile). Evidence:
+`claude auth status` JSON (cached 30m) + whitelisted `.claude.json`
+oauthAccount fields (organizationRateLimitTier default_claude_max_5x/20x →
+max5/max20; organizationType; freshness=profileFetchedAt). Never parses
+credentials. Resolution: EXACT rate-limit-tier fields always outrank
+family-level strings (subscriptionType/organizationType — their derivation
+time is unknowable; a token refresh rewrites credentials without re-deriving
+them, so freshness arbitration against them flaps — reviewer finding,
+removed). Exact-vs-exact disagreement → conservative-min "conflict";
+family-only disagreement → conservative-min; exact-vs-family disagreement →
+exact wins, "probable" + contested (bounded haiku probe ≥10m apart,
+≤3/episode, quota-aware, keeps trying to converge). Known one-directional
+blind spot: a REAL Max→Pro downgrade stays invisible until the next
+interactive/daemon profile fetch — safe because quota hits only WAIT (no
+rungs, no BLOCK). Measured (smoke, CLI 2.1.226): headless -p sessions
+refresh NO caches — freshness arrives passively (token refresh →
+family-level subscriptionType; any interactive session → profile+usage),
+stale telemetry degrades to the conservative unknown band, and CLI quota
+hits are the hard backstop. Tiers →
+envelopes: max20 4/5 (opus 2), max5+max_unknown 2/3, pro 1/2, unknown 1/1;
+fable cap 1 everywhere. Utilization: cachedUsageUtilization (primary) +
+automation statusline files (`telemetry/sessions/`, atomic, whitelist-only)
+→ telemetry table; stale >45m = decisions treat as unknown (normal, no
+burst). Pressure bands gate role classes (finish-first, §17); CLI quota hit
+→ global quota_hold (reset-aware only when fresh usage corroborates ≥90%).
+Workers run `--setting-sources project --settings automation-settings.json`
+(owner user settings never loaded/modified — their ntfy hooks would fire on
+every worker otherwise) + billing/nesting env stripped.
 
-## Non-obvious decisions
-- Shim+SchedTask/detached lanes over `claude --bg` (v2.1.226 has it): one
-  verified probe path; Task Scheduler is the proven SSH-independent
-  supervisor here. CLI `--json-schema` exists but is unused by design
-  (workers write result files; uniform stub-testable contract).
-- cmd.exe AutoRun on this machine breaks `shell=True` cwd AND bare .CMD
-  spawns (claude.CMD!) → every shell/batch invocation goes through
-  `cmd /d /c`. Regression risk if bypassed.
-- No global git identity on machine → workspaces get local
-  user.name=engine-control at init.
-- Repair1 resumes the implementer session (`--resume <uuid5> --fork-session`);
-  repair2+ fresh. Cherry-pick idempotency = `-x` provenance grep.
+## Auth/billing gate
+Not subscription (api key/gateway env/logged out) → all steps WAITING_AUTH,
+notify once, auto-recheck; `cmd_start` refuses launch. WAITING_AUTH is a
+WAITING state (never consumes attempts).
 
-## Workspaces (created by `control.py init`)
-`C:\projects\automation-workspace\internet` — baseline `8af6de99` (engine-lab
-tip; descends from main→PR#1→PR#4). `...\ai` — baseline `8c7e08d2`
-(commit-pending-export-work tip = main+resilience work). Both on
-`automation/integration`, push URL DISABLED, local git identity set.
+## Roadmap DAG (roadmap.yaml)
+01,02 parallel roots · 03,04←02 (parallel) · 05←03+04 (fable planner) ·
+06,07←05 (parallel) · 08←01+06+07 (fable) · 09a←01:validated (background
+evidence lane) · 09←08+09a · 10←08 (fable) · 11←09+10 (audit: true, fable
+whole-system audit). Cycles/unknown deps → refuse start / notify, never
+silently ignore.
+
+## Known reality of this machine (verified in commissioning)
+- schtasks /tr: >260 create-fails; ~241–260 created-but-NEVER-RUNS
+  (silent). spawn() enforces len ≤235 and checks /run rc.
+- tempfile.mkdtemp dirs (Py3.13+) carry a restricted DACL the Task-Scheduler
+  logon session cannot read → tests use harness.mkroot(); never mkdtemp for
+  anything a scheduled task must read.
+- Live conflict observed: profile says max20 (exact), credentials say pro
+  (stale family string predating the 08-04 upgrade) — the exact tier wins by
+  rule; detection stays contested + probing. Do not "fix" by hand.
 
 ## Tests
-`tests/test_infra.py` (13) + `tests/test_flow.py` (19 canary scenarios) —
-full 20-item Step-0 acceptance matrix + audit regressions (multi-task crash
-safety, /retry cycle, reviewer BLOCK, guard extensions). Manual reboot
-procedure: `tests/MANUAL_REBOOT_TEST.md`.
-
-## Known gaps / residual risk (accepted for Step 0)
-- Telegram creds absent → WAITING_CONFIG until owner creates the dev bot.
-- Worker `Bash(python:*)` could in principle write outside its worktree;
-  git verbs are permission-scoped, the rest is gated by acceptance checks +
-  independent review. Full sandboxing deferred.
-- On cherry-pick conflict the repair worker re-applies the change as new
-  commits on the current integration content (its scoped tools cannot
-  rebase); /retry re-plans from the new tip if that fails. Canary verifies
-  entry into REPAIRING only.
-- step-10's independent fable audit uses the `audit` role prompt; controller
-  wiring for it lands when step-10 is reached. WAITING_USER has no automatic
-  entry (reserved for future /pause-at-step semantics). Deadline-kill path
-  unit-logic only, not canary-timed.
+tests/: test_infra 13 · test_flow 19 · test_capacity 38 (detector matrix,
+telemetry matrix, governor policy, shape-drift, finish-cap) · test_dag 15
+(topology, parallel diamond, background lane incl. stale-telemetry,
+upgrade/downgrade, pressure, quota hold + sustained outage, fable cap, audit
+step, overlap conflict, concurrent recovery). All green 2026-08-10 after
+independent Opus review REPAIR round. `scripts/smoke_real.py` = tiny
+real-Claude smoke (§45), PASS.
 
 ## Start the roadmap
-`python control.py start` (after Telegram .env). Everything else is the tick.
+`python control.py start` (verifies DAG, auth, tick task, backs up state.db,
+persists roadmap_run_id, notifies). Telegram absent → steps WAITING_CONFIG
+until .env has DEV_TELEGRAM_*; then fully autonomous.

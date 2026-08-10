@@ -459,9 +459,12 @@ class TestSupervision(unittest.TestCase):
         self.assertEqual((art / "exitcode.txt").read_text().strip(), "0")
 
     def test_task_lane_end_to_end(self):
-        """One real one-shot Scheduled Task run through the shim contract."""
-        import tempfile
-        root = Path(tempfile.mkdtemp(prefix="ec-task-"))
+        """One real one-shot Scheduled Task run through the shim contract.
+        Root must NOT come from tempfile.mkdtemp: its restricted Windows DACL
+        is unreadable from the Task Scheduler logon session (commissioning
+        finding — this is why this test failed in Step 0)."""
+        from harness import mkroot
+        root = mkroot("ec-task-")
         ctx = common.Ctx(root)
         key = "canary.tasklane.probe.1"
         rd = cr.art_dir(ctx, key)
