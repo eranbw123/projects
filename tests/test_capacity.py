@@ -331,6 +331,41 @@ class TestTelemetry(Base):
         self.assertEqual(rows["s7"]["pct7"], 12)
         self.assertEqual((rows["sb"]["pct5"], rows["sb"]["pct7"]), (50, 20))
 
+    def test_2b_real_cli_payload_shape(self):
+        """The contract Claude Code (>=2.1.226) actually sends: top-level
+        rate_limits, used_percentage (not utilization), epoch resets_at.
+        Regression: this exact shape used to be dropped entirely, so
+        statusline telemetry never reached /status."""
+        r5, r7 = int(time.time()) + 3600, int(time.time()) + 6 * 86400
+        p = self.capture({
+            "session_id": "real1", "cwd": "C:\\x", "version": "2.1.226",
+            "model": {"id": "claude-opus-5", "display_name": "Opus 5"},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 6.0, "resets_at": r5},
+                "seven_day": {"used_percentage": 2.5, "resets_at": r7}}})
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("5h:6", p.stdout)   # the statusline itself shows usage
+        cap.ingest_telemetry(self.ctx, self.conn)
+        row = self.conn.execute(
+            "SELECT * FROM telemetry WHERE session_id='real1'").fetchone()
+        self.assertEqual((row["pct5"], row["pct7"]), (6.0, 2.5))
+        # epoch resets_at must land as ISO the controller can reason about
+        self.assertFalse(common.is_past(row["reset5"]))
+        common.parse_iso(row["reset7"])  # must not raise
+
+    def test_2c_session_files_pruned(self):
+        d = self.sessions_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        old = d / "ancient.json"
+        old.write_text('{"session_id": "ancient", "pct5": 1}')
+        past = time.time() - 11 * 86400
+        os.utime(old, (past, past))
+        fresh = d / "fresh.json"
+        fresh.write_text('{"session_id": "fresh", "pct5": 2}')
+        cap.ingest_telemetry(self.ctx, self.conn)
+        self.assertFalse(old.exists(), "10-day-old session file must be pruned")
+        self.assertTrue(fresh.exists())
+
     def test_5_malformed_stdin(self):
         p = self.capture("{not json")
         self.assertEqual(p.returncode, 0)

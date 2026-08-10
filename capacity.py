@@ -500,6 +500,13 @@ def ingest_telemetry(ctx, conn) -> int:
             "pct7": obj.get("pct7"), "reset7": obj.get("reset7"),
             "model": obj.get("model"),
         })
+    cutoff = now_dt().timestamp() - 10 * 86400
+    for f in files:
+        try:  # one file per session id, forever — prune abandoned sessions
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
     for r in rows:
         r["pct5"], r["pct7"] = _num(r.get("pct5")), _num(r.get("pct7"))
         if r.get("pct5") is None and r.get("pct7") is None:
