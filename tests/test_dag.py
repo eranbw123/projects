@@ -313,6 +313,63 @@ steps:
         self.assertEqual(attempts, 1, "quota wait consumed a repair attempt")
 
 
+class TestBackgroundUnderStaleTelemetry(unittest.TestCase):
+    """Reviewer finding (major): stale telemetry is the NORMAL production
+    state; the background lane (and thus 09a->09->11) must still run."""
+
+    def test_background_runs_with_stale_usage(self):
+        sb = Sandbox(steps_yaml="""
+steps:
+  - {id: BG, ordinal: 1, title: bg, repos: [canary], depends_on: [], background: true, objective: g, acceptance: g}
+""", capacity=dict(tier="max20", fetched_ms=__import__('harness').now_ms() - 3 * 3600 * 1000))
+        try:
+            sb.start()
+            ctx = sb.ctx()
+            conn = sb.conn()
+            cap.ingest_telemetry(ctx, conn)
+            u = cap.current_usage(conn)
+            conn.close()
+            self.assertTrue(u is None or u["stale"], "fixture must be stale")
+            self.assertTrue(sb.until_state("ACCEPTED", 240, step_id="BG"),
+                            sb.transitions())
+        finally:
+            sb.cleanup()
+
+
+class TestSustainedQuotaOutage(unittest.TestCase):
+    """Reviewer finding (major): a long quota outage must NEVER consume a
+    repair rung or BLOCK a step — not even after many rounds."""
+
+    def test_long_outage_stays_waiting(self):
+        sb = Sandbox(script={"implementer": "quota"})
+        try:
+            sb.start()
+            self.assertTrue(sb.run_until(
+                lambda c: db.step_detail(sb.step_row(c)).get("quota_streak", 0) >= 8,
+                180), sb.transitions())
+            conn = sb.conn()
+            step = sb.step_row(conn)
+            self.assertNotEqual(step["state"], "BLOCKED")
+            repairs = conn.execute("SELECT COUNT(*) c FROM runs WHERE "
+                                   "role='repair'").fetchone()["c"]
+            attempts = conn.execute(
+                "SELECT COUNT(*) c FROM runs WHERE role IN ('implementer','repair')"
+                " AND status IN ('DONE','FAILED')").fetchone()["c"]
+            conn.close()
+            self.assertEqual(repairs, 0, "quota outage reached the repair ladder")
+            self.assertEqual(attempts, 0, "quota outage consumed attempts")
+            # capacity returns -> the roadmap resumes with no owner action
+            sb.set_script({})
+            conn = sb.conn()
+            db.kv_set(conn, "quota_hold_until", common.iso_in(-1))
+            with conn:
+                conn.execute("UPDATE steps SET retry_at=?", (common.iso_in(-1),))
+            conn.close()
+            self.assertTrue(sb.until_state("ACCEPTED", 240), sb.transitions())
+        finally:
+            sb.cleanup()
+
+
 class TestFableSerialization(unittest.TestCase):
     """§26/§27: at most one concurrent fable lane, enforced mechanically."""
 

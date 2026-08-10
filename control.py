@@ -387,19 +387,19 @@ def wait_quota(ctx, conn, step):
             pass
     db.kv_set(conn, "quota_hold_until", hold)
     cap.detect(ctx, conn, force=True, trigger="quota")
-    if streak > 6:
-        # Repeated quota classification is almost certainly a real failure
-        # being misread; stop looping and route it to the repair ladder.
-        repair_or_block(ctx, conn, step,
-                        f"quota-classified outcome repeated x{streak}; treating as worker failure")
-        return
-    retry_min = int(ctx.getenv("EC_QUOTA_RETRY_MIN", str(QUOTA_RETRY_MIN)))
+    # A quota wait is NEVER an implementation failure and never reaches the
+    # repair ladder (weekly-limit outages can legitimately last days —
+    # commissioning review finding). Backoff escalates 1x/2x/4x and the owner
+    # is re-notified periodically instead.
+    backoff = retry_min * (2 ** min(streak // 5, 2))
     with conn:
         conn.execute("UPDATE steps SET retry_at=? WHERE id=?",
-                     (common.iso_in(retry_min * 60), step["id"]))
+                     (common.iso_in(backoff * 60), step["id"]))
     db.transition(conn, ctx, step["id"], "WAITING_QUOTA", "model quota/limit hit")
-    tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
-               f"engine-control: {step['id']} waiting on model quota; retry in {retry_min}m")
+    if streak == 1 or streak % 8 == 0:
+        tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
+                   f"engine-control: {step['id']} waiting on model quota "
+                   f"(streak {streak}); retry in {backoff}m. Resumes automatically.")
 
 
 def goto_blocked(ctx, conn, step, reason):
@@ -610,6 +610,8 @@ def start_testing(ctx, conn, roadmap, step):
         return
     d = db.step_detail(step)
     repo = current_repo(ctx, step)
+    if repo_tests_busy(ctx, conn, roadmap, repo, exclude_step=step["id"]):
+        return  # one canonical suite per repo at a time; retried next tick
     cmds = repo_cfg(roadmap, repo)["tests"]
     dispatch(ctx, conn, step, "test", "", d["task_wt"], "TESTING",
              "canonical repo tests in worktree", test_cmds=cmds)
@@ -665,6 +667,26 @@ def repo_integration_busy(conn, ws: Path, exclude_step=None) -> bool:
     return False
 
 
+def repo_tests_busy(ctx, conn, roadmap, repo: str, exclude_step=None) -> bool:
+    """At most ONE canonical-test run per repository at a time (worktree or
+    integration): repo suites share machine-level fixtures/ports even when
+    checkouts are isolated (commissioning review finding)."""
+    for r in conn.execute(
+            "SELECT step_id FROM runs WHERE role='test' "
+            "AND status IN ('PREPARED','DISPATCHED')"):
+        if r["step_id"] == exclude_step:
+            continue
+        step = db.get_step(conn, r["step_id"])
+        if step is None:
+            continue
+        try:
+            if current_repo(ctx, step) == repo:
+                return True
+        except (KeyError, IndexError, TypeError):
+            continue
+    return False
+
+
 def enter_validation(ctx, conn, roadmap, step):
     """Controller-owned promotion: acceptance checks + cherry-pick to
     automation/integration (idempotent via -x provenance), then an independent
@@ -673,7 +695,8 @@ def enter_validation(ctx, conn, roadmap, step):
     repo = current_repo(ctx, step)
     rc = repo_cfg(roadmap, repo)
     ws = Path(rc["workspace"])
-    if repo_integration_busy(conn, ws, exclude_step=step["id"]):
+    if repo_integration_busy(conn, ws, exclude_step=step["id"]) or \
+            repo_tests_busy(ctx, conn, roadmap, repo, exclude_step=step["id"]):
         return  # stay in current state; retried next tick
     if not gate(ctx, conn, "test", None):
         return
@@ -745,7 +768,9 @@ def accept_step(ctx, conn, roadmap, step):
     scfg = step_cfg(roadmap, step["id"])
     handoff = build_handoff(ctx, conn, roadmap, step)
     hp = ctx.art / "handoffs" / f"{step['id']}.json"
-    common.write_atomic(hp, json.dumps(handoff, indent=1))
+    # handoffs are long-lived cross-step memory consumed by later prompts:
+    # redact like every other durable artifact (commissioning review finding)
+    common.write_atomic(hp, ctx.redact(json.dumps(handoff, indent=1)))
     errs = common.schema_errors(handoff, common.load_schema("handoff.schema.json"))
     if errs:
         db.event(conn, ctx, "handoff_schema_warn", step_id=step["id"], errs=errs)
@@ -845,14 +870,14 @@ def on_audit(ctx, conn, roadmap, step, run):
             ws = Path(repo_cfg(roadmap, primary)["workspace"])
             gitops.worktree_remove(ws, ctx.art / "wt" / f"{step['id']}-audit")
             hp = ctx.art / "handoffs" / f"{step['id']}.json"
-            common.write_atomic(hp, json.dumps({
+            common.write_atomic(hp, ctx.redact(json.dumps({
                 "version": 1, "step_id": step["id"], "accepted_commits": [],
                 "behavior": obj.get("summary", ""), "decisions": [],
                 "interfaces": [], "metrics": {"verdict": verdict},
                 "hypotheses_supported": [], "hypotheses_falsified": [],
                 "failures": [], "uncertainty": "",
                 "verification": "independent audit (fresh context, read-only)",
-                "implications": json.dumps(obj.get("findings", []))[:3000]}, indent=1))
+                "implications": json.dumps(obj.get("findings", []))[:3000]}, indent=1)))
             with conn:
                 conn.execute("UPDATE steps SET handoff_path=?, active_run_id=NULL "
                              "WHERE id=?", (str(hp), step["id"]))
@@ -1368,8 +1393,14 @@ def tick(ctx) -> int:
                 ctx.log(tgm.SETUP_HELP)
         else:
             db.kv_set(conn, "warned_no_tg", "0")
-            cmds = tgm.consume(ctx, conn, tg)
-            handle_commands(ctx, conn, tg, cmds)
+            try:
+                cmds = tgm.consume(ctx, conn, tg)
+                handle_commands(ctx, conn, tg, cmds)
+            except Exception as e:
+                # a command-handler bug must never cost the tick its
+                # reconcile/advance work (commissioning review finding)
+                ctx.log(f"telegram command error: {e!r}")
+                db.event(conn, ctx, "tg_handler_error", err=repr(e)[:300])
         try:
             reconcile(ctx, conn)
             cap.ingest_telemetry(ctx, conn)

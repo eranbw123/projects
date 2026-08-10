@@ -101,17 +101,24 @@ class TestPlanDetection(Base):
         v = self.detect()
         self.assertEqual((v["tier"], v["confidence"]), ("max20", "probable"))
 
-    def test_09_fresh_conservative_vs_stale_exact(self):
-        """A FRESHER conservative claim (pro) against a stale exact max20
-        forces the conservative envelope + conflict until refresh resolves."""
+    def test_09_family_claim_never_overrides_exact(self):
+        """Reviewer finding: family-level strings (subscriptionType) have
+        unknowable derivation time — a token refresh rewrites the file
+        without re-deriving them. Exact rate-limit tier ALWAYS wins,
+        regardless of mtimes; disagreement only keeps detection contested."""
         obj = claude_json_fixture(tier="max20", fetched_ms=hours_ago_ms(6))
         self.write_claude_json(obj)
         fresh = common.now()
         self.write_auth({**AUTH_SUBSCRIPTION, "subscriptionType": "pro",
                          "checked_at": fresh})
         v = self.detect()
-        self.assertEqual(v["confidence"], "conflict")
-        self.assertEqual(v["tier"], "pro")  # smallest claim wins during conflict
+        self.assertEqual((v["tier"], v["confidence"]), ("max20", "probable"))
+        self.assertTrue(v["contested"])
+        # and a routine credentials rewrite must not flap the tier
+        self.write_auth({**AUTH_SUBSCRIPTION, "subscriptionType": "pro",
+                         "checked_at": common.now()})
+        v2 = self.detect()
+        self.assertEqual(v2["tier"], "max20")
 
     def test_10_transition_5_to_20(self):
         self.sb.set_capacity(tier="max5")
@@ -216,6 +223,47 @@ class TestPlanDetection(Base):
                            ("kv", "v")):
             for r in self.conn.execute(f"SELECT {col} x FROM {table}"):
                 self.assertNotIn(secret, r["x"] or "")
+
+    def test_shape_drift_degrades_never_crashes(self):
+        """Reviewer finding: foreign .claude.json shapes must degrade to
+        conservative detection, never throw into the tick."""
+        cases = [
+            {"oauthAccount": "not-a-dict"},
+            {"oauthAccount": {"organizationType": ["claude_max"]},
+             "cachedUsageUtilization": "nope"},
+            {"cachedUsageUtilization": {"fetchedAtMs": True,
+                                        "utilization": {"five_hour": "x"}}},
+            {"cachedUsageUtilization": {"fetchedAtMs": now_ms(), "utilization": {
+                "five_hour": {"utilization": "93%"},
+                "seven_day": {"utilization": None}}}},
+        ]
+        for obj in cases:
+            self.write_claude_json(obj)
+            v = self.detect()          # must not raise
+            self.assertIn(v["tier"], ("max_unknown", "unknown", "pro"))
+            cap.ingest_telemetry(self.ctx, self.conn)   # must not raise
+            u = cap.current_usage(self.conn)
+            cap.pressure_level(u)      # must not raise
+            gov = cap.governor(self.ctx, self.conn, v, u, 1)
+            self.assertGreaterEqual(gov["target"], 0)
+
+    def test_finish_class_capped_under_pressure(self):
+        """Reviewer finding: finishing work is protected but must not balloon
+        past the target under high/very-high pressure."""
+        view = {"tier": "max20", "confidence": "confirmed",
+                "auth_mode": "subscription", "billing_overrides": []}
+        usage = {"pct5": 90, "pct7": 10, "fetched_at": common.now(),
+                 "age_min": 0.1, "stale": False}
+        g = cap.governor(self.ctx, self.conn, view, usage, 1)
+        self.assertEqual(g["pressure"], "very_high")
+        for i in range(3):
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO runs(key,step_id,role,model,status,created_at)"
+                    " VALUES(?,?,'repair','sonnet','DISPATCHED',?)",
+                    (f"fin{i}", f"s{i}", common.now()))
+        g = cap.governor(self.ctx, self.conn, view, usage, 1)
+        self.assertFalse(cap.can_dispatch(self.ctx, self.conn, g, "repair", "sonnet"))
 
     def test_probe_dispatch_and_pacing(self):
         """Unresolved tier triggers ONE bounded probe (stub worker), never a

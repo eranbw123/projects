@@ -37,11 +37,15 @@ ENVELOPES = {
     # normal/burst: concurrent Claude workers (probes and local test runs
     # excluded). model caps bound expensive models. background: max
     # background-lane steps. speculative reserved for future use.
+    # background >0 everywhere: lanes only start when no critical READY step
+    # wants the slot (sort order + target gate), so they starve nothing, and
+    # roadmap nodes gated on a background lane (09a->09->11) stay reachable
+    # on every tier (commissioning review finding).
     "max20":       dict(normal=4, burst=5, opus=2, fable=1, background=2, speculative=1),
     "max5":        dict(normal=2, burst=3, opus=1, fable=1, background=1, speculative=0),
     "max_unknown": dict(normal=2, burst=3, opus=1, fable=1, background=1, speculative=0),
-    "pro":         dict(normal=1, burst=2, opus=1, fable=1, background=0, speculative=0),
-    "unknown":     dict(normal=1, burst=1, opus=1, fable=1, background=0, speculative=0),
+    "pro":         dict(normal=1, burst=2, opus=1, fable=1, background=1, speculative=0),
+    "unknown":     dict(normal=1, burst=1, opus=1, fable=1, background=1, speculative=0),
 }
 
 TIER_RANK = {"unknown": 0, "pro": 1, "max_unknown": 2, "max5": 2, "max20": 3}
@@ -155,7 +159,9 @@ def oauth_profile(ctx) -> dict:
     obj = common.read_json(p)
     if not isinstance(obj, dict):
         return {"present": False, "malformed": obj is not None}
-    oa = obj.get("oauthAccount") or {}
+    oa = obj.get("oauthAccount")
+    if not isinstance(oa, dict):  # shape drift degrades, never crashes the tick
+        oa = {}
     fetched = oa.get("profileFetchedAt")
     if isinstance(fetched, (int, float)) and fetched > 1e12:
         fetched_iso = datetime.fromtimestamp(fetched / 1000, tz=timezone.utc
@@ -214,7 +220,8 @@ def classify(ctx, auth: dict, profile: dict) -> dict:
             else "unknown"
     else:
         auth_mode = "unknown"
-    overrides = [k for k in BILLING_OVERRIDE_ENV if os.environ.get(k)]
+    overrides = [k for k in BILLING_OVERRIDE_ENV
+                 if os.environ.get(k) or ctx.getenv(k)]
 
     claims = []  # (tier, source, freshness_iso, exact?)
     prof_family = _family_from(profile.get("organizationType"), None)
@@ -238,30 +245,43 @@ def classify(ctx, auth: dict, profile: dict) -> dict:
 
     family = prof_family if prof_family != "unknown" else auth_family
 
+    # Exact rate-limit-tier fields ARE the capacity ground truth; family-level
+    # strings (subscriptionType, organizationType) are scope echoes whose
+    # derivation time is unknowable — a routine OAuth token refresh rewrites
+    # .credentials.json without re-deriving them. Freshness-margin arbitration
+    # between the two therefore flaps on token refreshes (commissioning review
+    # finding): exact beats family, always. Disagreement keeps `contested`
+    # true so bounded probes continue, and a REAL downgrade corrects on the
+    # next profile fetch (quota backstop covers the gap).
+    exact = [c for c in claims if c[3]]
+    family_claims = [c for c in claims if not c[3]]
     if not claims:
         tier, confidence = "unknown", "conservative_fallback"
+    elif exact:
+        tiers = {c[0] for c in exact}
+        if len(tiers) == 1:
+            tier = tiers.pop()
+            disagree = any(TIER_RANK[c[0]] != TIER_RANK[tier] and
+                           not (c[0] == "max_unknown" and tier in ("max5", "max20"))
+                           for c in family_claims)
+            confidence = "probable" if disagree else "confirmed"
+        else:
+            # two exact fields disagree: conservative envelope until refreshed
+            tier = min(tiers, key=lambda t: TIER_RANK[t])
+            confidence = "conflict"
     else:
-        tiers = {c[0] for c in claims}
-        # max_unknown agrees with any max tier; collapse before conflict test
+        tiers = {c[0] for c in family_claims}
         effective = {t for t in tiers if t != "max_unknown"} or {"max_unknown"}
         if len(effective) == 1:
             tier = effective.pop()
-            confidence = "confirmed" if any(c[3] for c in claims) or tier in ("pro",) \
-                else "probable"
+            confidence = "confirmed" if tier == "pro" else "probable"
         else:
-            # genuine conflict (e.g. profile says max20, credentials say pro)
-            claims.sort(key=lambda c: c[2] or "", reverse=True)
-            freshest = claims[0]
-            others = claims[1:]
-            margin_min = (_age_min(others[0][2]) - _age_min(freshest[2])) if others else 0
-            if freshest[3] and margin_min > 30:
-                # exact, clearly fresher evidence wins; keep probing to converge
-                tier, confidence = freshest[0], "probable"
-            else:
-                tier = min((c[0] for c in claims), key=lambda t: TIER_RANK[t])
-                confidence = "conflict"
-    contested = len({c[0] for c in claims if c[0] != "max_unknown"} or
-                    {"max_unknown"}) > 1
+            tier = min(effective, key=lambda t: TIER_RANK[t])
+            confidence = "conflict"
+    contested = confidence in ("conflict",) or (
+        bool(exact) and any(TIER_RANK[c[0]] != TIER_RANK[exact[0][0]] and
+                            not (c[0] == "max_unknown" and exact[0][0] in ("max5", "max20"))
+                            for c in family_claims))
     return {
         "auth_mode": auth_mode, "family": family, "tier": tier,
         "confidence": confidence, "contested": contested,
@@ -405,23 +425,37 @@ def telemetry_dir(ctx) -> Path:
     return d
 
 
+def _num(v):
+    """Numeric percentage or None — foreign shapes degrade, never crash."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
 def read_usage_cache(ctx) -> dict | None:
-    """5h/7d utilization that Claude Code itself caches in .claude.json."""
+    """5h/7d utilization that Claude Code itself caches in .claude.json.
+    Every level of the shape is validated: this file's layout is not ours."""
     obj = common.read_json(claude_json_path(ctx))
     if not isinstance(obj, dict):
         return None
-    cu = obj.get("cachedUsageUtilization") or {}
-    u = cu.get("utilization") or {}
-    fetched = cu.get("fetchedAtMs")
-    if not u or not isinstance(fetched, (int, float)):
+    cu = obj.get("cachedUsageUtilization")
+    if not isinstance(cu, dict):
         return None
-    fh, sd = u.get("five_hour") or {}, u.get("seven_day") or {}
+    u = cu.get("utilization")
+    fetched = cu.get("fetchedAtMs")
+    if not isinstance(u, dict) or isinstance(fetched, bool) \
+            or not isinstance(fetched, (int, float)):
+        return None
+    fh = u.get("five_hour") if isinstance(u.get("five_hour"), dict) else {}
+    sd = u.get("seven_day") if isinstance(u.get("seven_day"), dict) else {}
     return {
         "session_id": None, "source": "cli_cache",
         "fetched_at": datetime.fromtimestamp(fetched / 1000, tz=timezone.utc
                                              ).isoformat(timespec="seconds"),
-        "pct5": fh.get("utilization"), "reset5": fh.get("resets_at"),
-        "pct7": sd.get("utilization"), "reset7": sd.get("resets_at"),
+        "pct5": _num(fh.get("utilization")),
+        "reset5": fh.get("resets_at") if isinstance(fh.get("resets_at"), str) else None,
+        "pct7": _num(sd.get("utilization")),
+        "reset7": sd.get("resets_at") if isinstance(sd.get("resets_at"), str) else None,
         "model": None,
     }
 
@@ -453,6 +487,7 @@ def ingest_telemetry(ctx, conn) -> int:
             "model": obj.get("model"),
         })
     for r in rows:
+        r["pct5"], r["pct7"] = _num(r.get("pct5")), _num(r.get("pct7"))
         if r.get("pct5") is None and r.get("pct7") is None:
             continue
         dup = conn.execute(
@@ -494,8 +529,8 @@ def pressure_level(usage: dict | None) -> str:
     """plenty | moderate | high | very_high | critical (quota) | unknown"""
     if usage is None or usage.get("stale"):
         return "unknown"
-    p5 = usage.get("pct5") or 0
-    p7 = usage.get("pct7") or 0
+    p5 = _num(usage.get("pct5")) or 0
+    p7 = _num(usage.get("pct7")) or 0
     def band5(p):
         return 0 if p < 50 else 1 if p < 70 else 2 if p < 85 else 3 if p < 95 else 4
     def band7(p):
@@ -511,11 +546,15 @@ ROLE_CLASS = {
     "audit": "finish",
     "implementer": "build", "planner": "plan",
 }
-# classes allowed per pressure level (free/local always allowed)
+# classes allowed per pressure level (free/local always allowed).
+# background stays allowed under moderate/unknown pressure: stale telemetry
+# is the NORMAL production state (headless -p refreshes no caches), and
+# background lanes are already slot-gated behind critical READY work — only
+# genuine high pressure closes them (commissioning review finding).
 ALLOWED = {
     "plenty":    {"finish", "build", "plan", "start", "background"},
-    "moderate":  {"finish", "build", "plan", "start"},
-    "unknown":   {"finish", "build", "plan", "start"},
+    "moderate":  {"finish", "build", "plan", "start", "background"},
+    "unknown":   {"finish", "build", "plan", "start", "background"},
     "high":      {"finish", "build", "plan"},
     "very_high": {"finish"},
     "critical":  set(),
@@ -583,11 +622,16 @@ def can_dispatch(ctx, conn, gov, role, model, new_step=False, background=False) 
         return True
     if klass not in gov["allowed"]:
         return False
-    if new_step and "start" not in gov["allowed"]:
+    if new_step and "start" not in gov["allowed"] and not background:
         return False
     if background and "background" not in gov["allowed"]:
         return False
     if gov["active"] >= gov["target"] and klass in ("build", "plan"):
+        return False
+    # finishing work is protected but not unbounded: under real pressure it
+    # may not balloon past the target either (commissioning review finding)
+    if klass == "finish" and gov["pressure"] in ("high", "very_high") \
+            and gov["active"] >= max(gov["target"], 2):
         return False
     if model == "fable" and model_active(conn, "fable") >= gov["env"]["fable"]:
         return False
