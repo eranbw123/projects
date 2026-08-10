@@ -15,6 +15,7 @@ repos:
     source: 'C:\github\internet'
     workspace: 'C:\projects\automation-workspace\internet'
     baseline: 8af6de995d7555bca78d562a8212118824d83bff
+    pr_base: engine-lab          # baseline == this branch's tip: PR shows only automation work
     tests:
       - python test_discovery.py
       - python test_watch.py
@@ -22,6 +23,7 @@ repos:
     source: 'C:\github\ai'
     workspace: 'C:\projects\automation-workspace\ai'
     baseline: 8c7e08d2f77d91cf3e75684065e247cabcb82897
+    pr_base: commit-pending-export-work   # baseline == this branch's tip
     tests:
       - python -m unittest discover -p "test_*.py"
 

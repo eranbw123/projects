@@ -21,6 +21,7 @@ import capacity as cap
 import claude_runner as cr
 import common
 import db
+import ghpr
 import gitops
 import telegram as tgm
 import validators as vd
@@ -1302,6 +1303,14 @@ def on_validating(ctx, conn, roadmap, step, run):
         repair_or_block(ctx, conn, step, "integration tests failed:\n"
                         + common.tail((obj or {}).get("report", "no artifact"), 60))
         return
+    # The only moment the integration tip is provably test-green (integration
+    # is serialized per repo, so the tip == what this run validated). ghpr
+    # pushes exactly this sha to GitHub — never the live unvalidated tip.
+    for rname, rcc in roadmap["repos"].items():
+        if Path(rcc["workspace"]).resolve() == Path(run["cwd"]).resolve():
+            db.kv_set(conn, f"pr_tip:{rname}",
+                      gitops.current_sha(Path(run["cwd"]), INTEGRATION))
+            break
     d = db.step_detail(step)
     idx = run["task_idx"]  # the task this validation run actually validated
     done = d.get("done_tasks", [])
@@ -1347,6 +1356,11 @@ def status_text(ctx, conn) -> str:
         lines.append("Usage: no telemetry yet")
     lines.append(f"Claude workers: {gov['active']} active · target {gov['target']}"
                  f" · pressure {gov['pressure']} · pace {gov['pace']}")
+    prs = [f"{r['k'].split(':', 1)[1]} #{r['v']}" for r in
+           conn.execute("SELECT k,v FROM kv WHERE k LIKE 'pr_number:%' AND v!='' "
+                        "ORDER BY k")]
+    if prs:
+        lines.append("GitHub PRs: " + " · ".join(prs) + " (/prs for links)")
     if ready:
         lines.append(f"READY: {', '.join(ready)}")
     for s in conn.execute("SELECT * FROM steps ORDER BY ordinal"):
@@ -1521,6 +1535,20 @@ def handle_commands(ctx, conn, tg, cmds):
                             f"{r['step_id'] or ''} {(r['payload'] or '')[:160]}"
                             for r in rows[::-1])
             tg.send(out or "no events")
+        elif name == "/prs":
+            repos = sorted({r["k"].split(":", 1)[1] for r in conn.execute(
+                "SELECT k FROM kv WHERE k LIKE 'pr_tip:%' OR k LIKE 'pr_url:%'")})
+            out = []
+            for r in repos:
+                url = db.kv_get(conn, f"pr_url:{r}")
+                tip = db.kv_get(conn, f"pr_tip:{r}") or ""
+                lag = "" if tip == db.kv_get(conn, f"pr_pushed:{r}") else " · push pending"
+                out.append(f"{r}: {url or 'no PR yet'} (validated {tip[:10]}{lag})")
+            if out:
+                tg.send("engine-control PRs:\n" + "\n".join(out))
+            else:
+                tg.send("engine-control: no validated automation work has "
+                        "reached GitHub yet (PRs open on the first validated task)")
 
 
 # ---------- tick ----------
@@ -1584,6 +1612,10 @@ def tick(ctx) -> int:
             backup_state(ctx, conn)
             if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
                 advance_all(ctx, conn, roadmap)
+            if db.kv_get(conn, "roadmap_started") == "1":
+                # runs even when paused: already-validated work should stay
+                # visible on GitHub during an incident. Never raises.
+                ghpr.pr_sync(ctx, conn, roadmap)
             if db.kv_get(conn, "orch_err_streak", "0") != "0":
                 db.kv_set(conn, "orch_err_streak", "0")
         except Exception as e:
@@ -1809,13 +1841,27 @@ def cmd_doctor(ctx):
     print("[ok] telegram listener alive (commands answer in seconds)" if fresh
           else "[..] telegram listener not running (commands at 1-minute tick "
                "cadence; python control.py install-task starts it)")
+    exe = ghpr.gh_exe(ctx)
+    if exe:
+        a = subprocess.run([exe, "auth", "status"], capture_output=True, text=True)
+        if a.returncode == 0:
+            print(f"[ok] gh CLI authenticated ({exe})")
+        else:
+            print("[FAIL] gh CLI found but not authenticated — GitHub PR "
+                  "visibility will fail (gh auth login)"); bad = 1
+    else:
+        print("[..] gh CLI not found — GitHub PR visibility disabled "
+              "(install GitHub CLI + gh auth login, or set EC_GH_EXE)")
     try:
         roadmap = load_roadmap(ctx)
         print(f"[ok] roadmap: {len(roadmap['steps'])} steps, repos: {list(roadmap['repos'])}")
         for name, rc in roadmap["repos"].items():
             ws = Path(rc["workspace"])
             state = "ready" if (ws / ".git").exists() else "MISSING (python control.py init)"
-            print(f"     {name}: {ws} [{state}]")
+            slug = ghpr.github_slug(Path(rc["source"]))
+            pr = (f"PR → {slug} (base {rc.get('pr_base') or 'default'})" if slug
+                  else "no GitHub origin — PR visibility off")
+            print(f"     {name}: {ws} [{state}] · {pr}")
     except Exception as e:
         print(f"[FAIL] roadmap: {e}"); bad = 1
     return bad

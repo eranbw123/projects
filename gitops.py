@@ -123,13 +123,14 @@ def assert_safe(args: list[str], cwd, allow_push: bool = False) -> None:
 
 
 def run_git(args: list[str], cwd=None, allow_push=False, check=True,
-            timeout=300) -> subprocess.CompletedProcess:
+            timeout=300, env=None) -> subprocess.CompletedProcess:
     assert_safe(args, cwd, allow_push=allow_push)
     # git emits UTF-8; bare text=True decodes with the ANSI codepage (cp1255
     # here), which crashes subprocess's reader thread on real diffs and hands
     # back stdout=None with rc=0.
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                       encoding="utf-8", errors="replace", timeout=timeout)
+                       encoding="utf-8", errors="replace", timeout=timeout,
+                       env={**os.environ, **env} if env else None)
     if check and p.returncode != 0:
         raise GitError(f"git {' '.join(args)} rc={p.returncode}: {p.stderr.strip()[:400]}")
     return p
@@ -163,6 +164,16 @@ def clone(src: str | Path, dst: Path) -> None:
 def disable_push(repo: Path) -> None:
     """Mechanical prohibition: origin push URL becomes invalid."""
     run_git(["remote", "set-url", "--push", "origin", "DISABLED:engine-control-no-push"], cwd=repo)
+
+
+def push_url(repo: Path, url: str, refspec: str, timeout=120) -> None:
+    """Controller-only push to an EXPLICIT URL: clones never hold a pushable
+    remote (origin push stays DISABLED), so workers cannot push even with the
+    machine's ambient credential helper. assert_safe still applies — never
+    main/master, never forced, never a deletion. Non-interactive: a missing
+    credential fails fast instead of hanging the tick on a prompt."""
+    run_git(["push", url, refspec], cwd=repo, allow_push=True, timeout=timeout,
+            env={"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
 
 
 def current_sha(repo: Path, ref="HEAD") -> str:

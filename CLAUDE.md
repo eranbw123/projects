@@ -22,6 +22,8 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context.
   clones under `C:\projects\automation-workspace\`. Never weaken
   `gitops.assert_safe`.
 - Never touch main/master anywhere; integration branch is `automation/integration`.
+- GitHub pushes: controller-only, validated tips only, via `gitops.push_url`
+  (explicit URL — clones never hold a pushable remote; workers cannot push).
 - Secrets live in `.env` (gitignored); everything user-visible passes
   `ctx.redact`. Fable prompts must never contain raw conversation data.
 - The tick must stay short-lived, idempotent, and safe to overlap (lock) —

@@ -20,6 +20,15 @@ byte lock) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
 self-reset into a probe-per-tick loop (observed live, fixed). Contested-but-
 operational detection probes hourly; unresolved every 10m.
 
+## GitHub PR visibility (2026-08-10)
+`ghpr.py` tick phase: on_validating records the test-green integration tip
+(kv pr_tip); pr_sync pushes exactly that sha via `gitops.push_url` (explicit
+URL — clones keep DISABLED push remotes; guard unchanged) and keeps one open
+PR per repo (head automation/integration, base `pr_base:`/default; replaced
+after merge when new work lands). Failures notify once per tip + 10m backoff,
+never the error streak; runs while paused; idle cost 2 kv reads. gh CLI =
+auth/API (EC_GH_EXE). Telegram: push/PR-open notifications, `/prs`.
+
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied
 from SOAKING; `background: true` lanes never take critical slots; `audit:
