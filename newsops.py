@@ -42,19 +42,27 @@ COLLECTORS = ("stocks", "web", "youtube")
 # Aliases the owner can type -> canonical DISCOVERY_PROVIDER values, plus how
 # each engine is described back. PROVIDER_MODELS mirrors the product's
 # config.DEFAULT_MODELS for display only — the product picks its own default.
+# `chatgpt` means the browser session (chatgpt.com over CDP, no API key), NOT
+# the direct OpenAI API — that's the whole point of the ChatGPT engine here.
+# `openai` stays available as an explicit alias for the API path (needs a key).
 PROVIDER_CANON = {
     "claude": "claude_chat", "claude_chat": "claude_chat",
-    "chatgpt": "openai", "gpt": "openai", "openai": "openai",
+    "chatgpt": "chatgpt_browser", "gpt": "chatgpt_browser",
+    "chatgpt_browser": "chatgpt_browser",
+    "openai": "openai",
     "anthropic": "anthropic",
 }
 PROVIDER_LABELS = {
-    "claude_chat": "Claude via claude.ai session",
-    "openai": "ChatGPT via OpenAI API",
-    "anthropic": "Claude via Anthropic API",
+    "claude_chat": "Claude via claude.ai session (no key)",
+    "chatgpt_browser": "ChatGPT via chatgpt.com session (no key)",
+    "openai": "ChatGPT via OpenAI API (needs key)",
+    "anthropic": "Claude via Anthropic API (needs key)",
 }
-PROVIDER_MODELS = {"claude_chat": "claude-opus-5", "anthropic": "claude-opus-5",
-                   "openai": "gpt-5"}
+PROVIDER_MODELS = {"claude_chat": "claude-opus-5", "chatgpt_browser": "auto",
+                   "anthropic": "claude-opus-5", "openai": "gpt-5"}
 PROVIDER_NEEDS_KEY = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+# Browser engines need a logged-in tab in the CDP Chrome instead of a key.
+PROVIDER_NEEDS_BROWSER = {"claude_chat": "claude.ai", "chatgpt_browser": "chatgpt.com"}
 
 HELP = (
     "/news (or /news status) — appliance health, tasks, pending sends\n"
@@ -288,6 +296,10 @@ def config_set(ctx, key: str = "", *vals) -> str:
         env = _env_read(ctx)
         msg += (f"\nengine: {PROVIDER_LABELS[value]}"
                 f" · model {env.get('DISCOVERY_MODEL') or PROVIDER_MODELS[value]}")
+        site = PROVIDER_NEEDS_BROWSER.get(value)
+        if site:
+            msg += (f"\nℹ needs a logged-in {site} tab in the CDP Chrome"
+                    " (no API key)")
         need = PROVIDER_NEEDS_KEY.get(value)
         if need and not env.get(need):
             msg += (f"\n⚠ {need} is not set in the appliance .env — collections"

@@ -89,10 +89,11 @@ class TestValidators(unittest.TestCase):
                 check(bad)
 
     def test_provider(self):
+        # chatgpt means the browser session (no key); openai is the API path.
         for alias, canon in (("claude", "claude_chat"), ("claude_chat", "claude_chat"),
-                             ("chatgpt", "openai"), ("ChatGPT", "openai"),
-                             ("gpt", "openai"), ("openai", "openai"),
-                             ("anthropic", "anthropic")):
+                             ("chatgpt", "chatgpt_browser"), ("ChatGPT", "chatgpt_browser"),
+                             ("gpt", "chatgpt_browser"), ("chatgpt_browser", "chatgpt_browser"),
+                             ("openai", "openai"), ("anthropic", "anthropic")):
             self.assertEqual(newsops._provider(alias), canon)
         for bad in ("gemini", "", "webscrape"):
             with self.assertRaises(newsops.NewsError):
@@ -121,29 +122,37 @@ class TestConfigSet(NewsBase):
         self.assertIn("unknown setting", out)
         self.assertNotIn("volume", self.env_text())
 
-    def test_set_provider_chatgpt_writes_canonical_value_and_warns_on_missing_key(self):
+    def test_set_provider_chatgpt_is_the_browser_engine_no_key_needed(self):
         out = newsops.config_set(self.ctx, "provider", "chatgpt")
-        self.assertIn("claude_chat → openai", out)
-        self.assertIn("ChatGPT", out)
-        self.assertIn("OPENAI_API_KEY", out, "missing key must be surfaced")
-        self.assertIn("DISCOVERY_PROVIDER=openai", self.env_text())
+        self.assertIn("claude_chat → chatgpt_browser", out)
+        self.assertIn("chatgpt.com session", out)
+        self.assertIn("logged-in chatgpt.com tab", out, "browser requirement surfaced")
+        self.assertNotIn("OPENAI_API_KEY", out, "browser engine must not demand a key")
+        self.assertNotIn("⚠", out, "no key warning for the browser engine")
+        self.assertIn("DISCOVERY_PROVIDER=chatgpt_browser", self.env_text())
         self.assertTrue(any(n.startswith(".env-") for n in self.backups()))
         self.assertEqual(self.calls, [], "engine switch must not re-install tasks")
+
+    def test_set_provider_openai_is_the_api_path_and_warns_on_missing_key(self):
+        out = newsops.config_set(self.ctx, "provider", "openai")
+        self.assertIn("claude_chat → openai", out)
+        self.assertIn("OPENAI_API_KEY", out, "API path missing key must be surfaced")
+        self.assertIn("pip install openai", out)
+        self.assertIn("DISCOVERY_PROVIDER=openai", self.env_text())
 
     def test_set_provider_back_to_claude_has_no_warning(self):
         newsops.config_set(self.ctx, "provider", "chatgpt")
         out = newsops.config_set(self.ctx, "provider", "claude")
-        self.assertIn("openai → claude_chat", out)
+        self.assertIn("chatgpt_browser → claude_chat", out)
         self.assertIn("claude.ai session", out)
         self.assertNotIn("⚠", out)
         self.assertIn("DISCOVERY_PROVIDER=claude_chat", self.env_text())
 
     def test_set_provider_warns_when_a_pinned_model_overrides_the_default(self):
         (self.product / ".env").write_text(
-            "DISCOVERY_MODEL=claude-opus-5\nOPENAI_API_KEY=sk-x\n", encoding="utf-8")
+            "DISCOVERY_MODEL=gpt-9-custom\nANTHROPIC_API_KEY=sk-x\n", encoding="utf-8")
         out = newsops.config_set(self.ctx, "provider", "chatgpt")
         self.assertIn("DISCOVERY_MODEL is pinned", out)
-        self.assertNotIn("OPENAI_API_KEY is not set", out)
 
     def test_set_provider_rejects_unknown_engine(self):
         out = newsops.command(self.ctx, "set", ["provider", "gemini"])
@@ -195,8 +204,8 @@ class TestRunAndRouting(NewsBase):
         self.assertIn("engine: claude_chat", newsops.config_text(self.ctx))
         newsops.config_set(self.ctx, "provider", "chatgpt")
         out = newsops.config_text(self.ctx)
-        self.assertIn("engine: openai", out)
-        self.assertIn("gpt-5", out)
+        self.assertIn("engine: chatgpt_browser", out)
+        self.assertIn("auto", out)
 
     def test_command_never_raises(self):
         def boom(ctx):
