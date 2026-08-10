@@ -125,8 +125,11 @@ def assert_safe(args: list[str], cwd, allow_push: bool = False) -> None:
 def run_git(args: list[str], cwd=None, allow_push=False, check=True,
             timeout=300) -> subprocess.CompletedProcess:
     assert_safe(args, cwd, allow_push=allow_push)
+    # git emits UTF-8; bare text=True decodes with the ANSI codepage (cp1255
+    # here), which crashes subprocess's reader thread on real diffs and hands
+    # back stdout=None with rc=0.
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                       text=True, timeout=timeout)
+                       encoding="utf-8", errors="replace", timeout=timeout)
     if check and p.returncode != 0:
         raise GitError(f"git {' '.join(args)} rc={p.returncode}: {p.stderr.strip()[:400]}")
     return p
@@ -138,7 +141,8 @@ def git_ro(args: list[str], cwd, check=True) -> subprocess.CompletedProcess:
     sub = next((a for a in toks if not a.startswith("-")), "")
     if sub not in READ_ONLY_SUBCOMMANDS or _is_mutating(sub, [str(a) for a in args], toks):
         raise GitSafetyError(f"git_ro used for non-read-only invocation: {args}")
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120)
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=120)
     if check and p.returncode != 0:
         raise GitError(f"git {' '.join(args)} rc={p.returncode}: {p.stderr.strip()[:400]}")
     return p
@@ -150,7 +154,8 @@ def clone(src: str | Path, dst: Path) -> None:
     if not _under(dst.parent, _write_roots()):
         raise GitSafetyError(f"clone destination outside automation roots: {dst}")
     p = subprocess.run(["git", "clone", "--no-hardlinks", str(src), str(dst)],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, encoding="utf-8", errors="replace",
+                       timeout=600)
     if p.returncode != 0:
         raise GitError(f"clone failed: {p.stderr.strip()[:400]}")
 

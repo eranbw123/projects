@@ -29,11 +29,17 @@ def run_cmd(cmd: str, cwd, timeout=1800) -> tuple[int, str]:
     # cmd /d disables cmd.exe AutoRun. This machine has an AutoRun hook that
     # changes directory, which silently breaks shell=True's cwd — discovered
     # by the Step-0 canary suite. Never use bare shell=True here.
+    # The command goes as ONE pre-built string, never a list: list2cmdline
+    # escapes interior quotes as \" which cmd.exe does not unescape, so
+    # children received patterns like "test_*.py" WITH literal quotes (step-02
+    # ran 4 repair rungs against 'Ran 0 tests' this way). /s makes cmd strip
+    # exactly the outer quote pair and hand the command through verbatim.
     import os
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")  # keep checkouts clean
     try:
-        p = subprocess.run(["cmd", "/d", "/c", cmd], cwd=cwd, env=env,
-                           capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(f'cmd /d /s /c "{cmd}"', cwd=cwd, env=env,
+                           capture_output=True, text=True, errors="replace",
+                           timeout=timeout)
         out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
         return p.returncode, out
     except subprocess.TimeoutExpired:

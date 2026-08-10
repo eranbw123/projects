@@ -1440,7 +1440,9 @@ def tick(ctx) -> int:
                 episode = int(db.kv_get(conn, "orch_err_episode", "0")) + 1
                 db.kv_set(conn, "orch_err_episode", str(episode))
             episode = db.kv_get(conn, "orch_err_episode", "0")
-            ctx.log(f"orchestration error x{streak}: {e!r}")
+            import traceback
+            ctx.log(f"orchestration error x{streak}: {e!r}\n"
+                    + common.tail(traceback.format_exc(), 15))
             db.event(conn, ctx, "advance_error", err=repr(e)[:400], streak=streak)
             if streak in (1, 5):
                 tgm.notify(conn, ctx, f"orch-error:{episode}:{streak}",
