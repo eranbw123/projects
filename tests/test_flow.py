@@ -203,9 +203,9 @@ class TestValidatorGate(FlowBase):
                             ).fetchone()
         conn.close()
         self.assertIsNotNone(note)
-        # the push carries the attempt position and the actual failing lines
+        # the push carries the ladder position and the actual failing lines
         # (owner finding 2026-08-10: bare 'tests FAILED' forced a /why trip)
-        self.assertIn("attempt 1/4", note["text"])
+        self.assertIn("round 1", note["text"])
         self.assertGreater(len(note["text"].splitlines()), 1,
                            "failing test lines missing from the notification")
 
@@ -404,24 +404,67 @@ class TestTaskAdvanceCrashSafe(FlowBase):
         self.assertEqual(impls_t1, 1, "replay duplicated the task-1 worker")
 
 
-class TestRetryCycle(FlowBase):
-    """/retry re-arms a BLOCKED step with a fresh cycle and a fresh ladder."""
+def send_cmd(sb, conn, cmd):
+    sent = []
+
+    class T:
+        def send(self, t):
+            sent.append(t)
+            return True
+    control.handle_commands(sb.ctx(), conn, T(), [cmd])
+    return sent
+
+
+class TestRetryWarm(FlowBase):
+    """/retry of a step blocked mid-ladder resumes IN-PLACE: same cycle, same
+    plan, same worktree and commits — only the failure budget is refreshed.
+    No replan, no re-implementation (owner finding 2026-08-10)."""
     script = {"implementer": "fail", "repair": "fail"}
 
     def test_flow(self):
         self.assertTrue(self.sb.until_state("BLOCKED", 150), self.sb.transitions())
-        ctx = self.sb.ctx()
         conn = self.sb.conn()
-        sent = []
-
-        class T:
-            def send(self, t):
-                sent.append(t)
-                return True
-        import control as _c
-        _c.handle_commands(ctx, conn, T(), ["/retry"])
+        plan_before = self.sb.step_row(conn)["plan_path"]
+        sent = send_cmd(self.sb, conn, "/retry")
+        self.assertTrue(any("resuming in-place at repair" in s for s in sent), sent)
+        step = self.sb.step_row(conn)
+        self.assertEqual(step["state"], "REPAIRING")
+        d = db.step_detail(step)
+        self.assertEqual(d.get("cycle", 0), 0, "warm retry must keep the cycle")
+        self.assertEqual(d.get("rung_floor"), 4)
+        self.assertEqual(d.get("burned"), 0)
+        self.assertEqual(step["plan_path"], plan_before, "plan must survive")
         conn.close()
-        self.assertTrue(any("re-armed" in s for s in sent), sent)
+        self.sb.set_script({})  # repairs succeed from here on
+        self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        self.assertEqual(d.get("cycle", 0), 0)
+        planners = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='planner'"
+                                ).fetchone()["c"]
+        impls = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='implementer'"
+                             ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(planners, 1, "warm retry must never replan")
+        self.assertEqual(impls, 1, "warm retry must never re-implement")
+
+
+class TestRetryColdWhenWorktreeGone(FlowBase):
+    """Without the worktree there is nothing to resume: /retry falls back to
+    a fresh cycle from scratch (the pre-redesign behavior)."""
+    script = {"implementer": "fail", "repair": "fail"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("BLOCKED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        conn.close()
+        from harness import rmtree
+        rmtree(d["task_wt"])
+        conn = self.sb.conn()
+        sent = send_cmd(self.sb, conn, "/retry")
+        conn.close()
+        self.assertTrue(any("re-armed from scratch" in s for s in sent), sent)
         self.sb.set_script({})  # new cycle succeeds
         self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
         conn = self.sb.conn()
@@ -432,6 +475,83 @@ class TestRetryCycle(FlowBase):
             "AND status='DONE'").fetchone()["c"]
         conn.close()
         self.assertEqual(ok_impl, 1)
+
+
+class TestReviewConvergence(FlowBase):
+    """Rounds where the repair did real work (commits + green tests) and the
+    reviewer then finds NEW gating defects never exhaust the budget — the
+    pre-redesign ladder blocked this exact shape after 4 rounds even though
+    every repair fixed everything it was given (step-01, 2026-08-10)."""
+    script = {"reviewer.1": "repair", "reviewer.2": "repair", "reviewer.3": "repair",
+              "reviewer.4": "repair", "reviewer.5": "repair", "reviewer.6": "pass",
+              "repair": "ok"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("ACCEPTED", 300), self.sb.transitions())
+        self.assertNotIn("BLOCKED", [t[1] for t in self.sb.transitions()])
+        conn = self.sb.conn()
+        self.assertEqual(ladder(conn), 6, "impl + 5 progressing repairs")
+        reviews = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='reviewer'"
+                               ).fetchone()["c"]
+        diags = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='diagnostic'"
+                             ).fetchone()["c"]
+        d = db.step_detail(self.sb.step_row(conn))
+        conn.close()
+        self.assertEqual(reviews, 6)
+        self.assertEqual(diags, 1, "diagnostic every 3rd round of a grant")
+        self.assertEqual(d.get("burned", 0), 0,
+                         "genuine review findings must not burn budget")
+
+
+class TestAdvisoryFindingsPromote(FlowBase):
+    """A REPAIR verdict whose findings are all minor/info is advisory: the
+    controller promotes with notes instead of spending a repair round."""
+    script = {"reviewer.1": "repair_minor"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("ACCEPTED", 90), self.sb.transitions())
+        conn = self.sb.conn()
+        repairs = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='repair'"
+                               ).fetchone()["c"]
+        note = conn.execute("SELECT text FROM notifications WHERE text LIKE "
+                            "'%advisory%'").fetchone()
+        ev = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='review_advisory'"
+                          ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(repairs, 0)
+        self.assertIsNotNone(note)
+        self.assertEqual(ev, 1)
+
+
+class TestRunawayFuse(FlowBase):
+    """Even all-progressing rounds terminate: the total-rounds fuse blocks an
+    endless REPAIR loop, and a warm /retry then continues in-place."""
+    script = {"reviewer": "repair", "repair": "ok"}
+
+    def setUp(self):
+        self.sb = Sandbox(script=self.script, extra_env="EC_LADDER_TOTAL_MAX=3\n")
+        self.sb.start()
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("BLOCKED", 200), self.sb.transitions())
+        conn = self.sb.conn()
+        why = conn.execute(
+            "SELECT reason FROM transitions WHERE to_state='BLOCKED' "
+            "ORDER BY id DESC LIMIT 1").fetchone()["reason"]
+        self.assertIn("not converging", why)
+        self.assertEqual(ladder(conn), 3)
+        sent = send_cmd(self.sb, conn, "/retry")
+        self.assertTrue(any("resuming in-place" in s for s in sent), sent)
+        conn.close()
+        self.sb.set_script({"reviewer": "pass"})
+        self.assertTrue(self.sb.until_state("ACCEPTED", 150), self.sb.transitions())
+        conn = self.sb.conn()
+        d = db.step_detail(self.sb.step_row(conn))
+        planners = conn.execute("SELECT COUNT(*) c FROM runs WHERE role='planner'"
+                                ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(d.get("cycle", 0), 0)
+        self.assertEqual(planners, 1)
 
 
 class TestReviewerBlock(FlowBase):

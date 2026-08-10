@@ -126,9 +126,17 @@ def main():
         if mode == "pass_slow":
             time.sleep(3)
             mode = "pass"
-        verdict = {"pass": "PASS", "repair": "REPAIR", "block": "BLOCK"}.get(mode, "PASS")
-        findings = [] if verdict == "PASS" else [
-            {"severity": "major", "issue": "stub finding: mul must be a*b", "file": "app.py"}]
+        verdict = {"pass": "PASS", "repair": "REPAIR", "repair_minor": "REPAIR",
+                   "block": "BLOCK"}.get(mode, "PASS")
+        if verdict == "PASS":
+            findings = []
+        elif mode == "repair_minor":
+            findings = [
+                {"severity": "minor", "issue": "stub nit: docstring", "file": "app.py"},
+                {"severity": "info", "issue": "stub note: naming", "file": "app.py"}]
+        else:
+            findings = [
+                {"severity": "major", "issue": "stub finding: mul must be a*b", "file": "app.py"}]
         result.write_text(json.dumps({"version": 1, "verdict": verdict, "findings": findings}))
         return 0
     if role == "diagnostic":

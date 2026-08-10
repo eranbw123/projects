@@ -438,13 +438,15 @@ def _fmt_dur(mins) -> str:
 
 
 def attempts_note(conn, step) -> str:
-    """'attempt i/4 · retry k' — how much repair budget the current task has
-    burned and whether this is a /retry cycle. Owner finding 2026-08-10:
-    lifecycle messages without this hide whether a step is on its first try
-    or its last chance."""
+    """'round r · f/4 hard-failed · retry k' — where the current grant stands.
+    Owner finding 2026-08-10: lifecycle messages without this hide whether a
+    step is on its first try or its last chance. Rounds are grant-relative
+    (a warm /retry refreshes the budget without hiding history)."""
     d = db.step_detail(step)
-    pos = db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0))
-    parts = ([f"attempt {pos}/{LADDER_MAX}"] if pos else []) \
+    rounds = ladder_rounds(conn, step, d)
+    burned = d.get("burned", 0)
+    parts = ([f"round {rounds}"] if rounds else []) \
+        + ([f"{burned}/{LADDER_MAX} hard-failed"] if burned else []) \
         + ([f"retry {d['cycle']}"] if d.get("cycle") else [])
     return " · ".join(parts)
 
@@ -468,36 +470,71 @@ def dependents_of(conn, step_id) -> list[str]:
 
 def goto_blocked(ctx, conn, step, reason):
     db.transition(conn, ctx, step["id"], "BLOCKED", reason)
+    step = db.get_step(conn, step["id"])  # fresh counters for the notify
     d = db.step_detail(step)
-    pos = db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0))
+    rounds = ladder_rounds(conn, step, d)
     stalls = dependents_of(conn, step["id"])
-    bits = [f"attempts {pos}/{LADDER_MAX}"] \
+    warm = bool(step["plan_path"] and d.get("task_wt")
+                and Path(d["task_wt"]).exists())
+    bits = [f"round {rounds} · hard-failed {d.get('burned', 0)}/{LADDER_MAX}"] \
         + ([f"retry {d['cycle']}"] if d.get("cycle") else []) \
         + (["stalls: " + ", ".join(stalls)] if stalls else [])
     tgm.notify(conn, ctx, f"blocked:{step['id']}:{d.get('cycle',0)}",
                f"⛔ {step_label(step)} BLOCKED — {reason[:400]}\n"
                + " · ".join(bits) + "\n"
-               f"/why {step['id']} · /retry {step['id']} · /abort {step['id']}")
+               f"/why {step['id']} · /retry {step['id']}"
+               + (" (resumes in-place, work kept)" if warm else "")
+               + f" · /abort {step['id']}")
 
 
-def repair_or_block(ctx, conn, step, findings: str):
-    d = db.step_detail(step)
-    task_idx = d.get("task_idx", 0)
-    cycle = d.get("cycle", 0)
-    pos = db.ladder_pos(conn, step["id"], task_idx, cycle)
+def ladder_rounds(conn, step, d=None) -> int:
+    """Rungs consumed in the CURRENT grant: total for (task, cycle) minus the
+    floor recorded by a warm /retry (which refreshes budget without wiping
+    the cycle's history)."""
+    d = db.step_detail(step) if d is None else d
+    return db.ladder_pos(conn, step["id"], d.get("task_idx", 0),
+                         d.get("cycle", 0)) - d.get("rung_floor", 0)
+
+
+def repair_or_block(ctx, conn, step, findings: str, progressed=False):
+    """Route a failed round. The budget distinguishes HOW it failed: a rung
+    that did real work (commits, tests green) before an independent reviewer
+    found NEW defects is the process converging and never burns budget —
+    only hard failures do (progressed=False: worker failed, no commits,
+    tests red). LADDER_MAX bounds hard failures; LADDER_TOTAL_MAX is the
+    runaway fuse for endless always-something review loops. Owner finding
+    2026-08-10: step-01 was blocked after 4 rounds in which every repair
+    fixed every finding it was given and the final review itself said
+    'REPAIR, not BLOCK'."""
+    step = db.get_step(conn, step["id"])  # callers hold pre-set_detail rows;
+    d = db.step_detail(step)              # a stale write here loses counters
     d["last_findings"] = findings[:6000]
+    # burn once per outcome event: capacity-deferred dispatch re-enters here
+    # every tick with the same active run — that is one failure, not many
+    if not progressed and d.get("burn_mark") != step["active_run_id"]:
+        d["burned"] = d.get("burned", 0) + 1
+        d["burn_mark"] = step["active_run_id"]
     db.set_detail(conn, step["id"], d)
     if not d.get("task_wt"):
         goto_blocked(ctx, conn, step,
                      "failure before implementation stage: " + findings[:200])
         return
-    if pos >= LADDER_MAX:
-        goto_blocked(ctx, conn, step, f"repair budget exhausted ({pos} attempts). Last: {findings[:200]}")
+    rounds = ladder_rounds(conn, step, d)
+    if d.get("burned", 0) >= LADDER_MAX:
+        goto_blocked(ctx, conn, step,
+                     f"repair budget exhausted ({d['burned']} hard-failed "
+                     f"attempts in {rounds} rounds). Last: {findings[:200]}")
         return
-    if pos == 3 and not d.get("diagnosed"):
+    if rounds >= int(ctx.getenv("EC_LADDER_TOTAL_MAX", str(LADDER_TOTAL_MAX))):
+        goto_blocked(ctx, conn, step,
+                     f"not converging: {rounds} rounds this grant without a "
+                     f"review PASS (work is real but review keeps finding "
+                     f"more). Last: {findings[:200]}")
+        return
+    if rounds >= 3 and rounds - d.get("diag_round", 0) >= 3:
         dispatch_diagnostic(ctx, conn, step, findings)
         return
-    dispatch_repair(ctx, conn, step, findings, pos)
+    dispatch_repair(ctx, conn, step, findings, rounds)
 
 
 def dispatch_repair(ctx, conn, step, findings, pos):
@@ -505,9 +542,12 @@ def dispatch_repair(ctx, conn, step, findings, pos):
     scfg = step_cfg(roadmap, step["id"])
     if not gate(ctx, conn, "repair", route_model(scfg, "repair")[0]):
         return  # findings persisted; retried next tick
+    step = db.get_step(conn, step["id"])
     d = db.step_detail(step)
     resume_session = None
-    if pos == 1:  # first repair continues the implementer's session context
+    # only the genuine first repair right after implementation resumes the
+    # implementer's session (a warm-retry grant starts long after it died)
+    if pos == 1 and not d.get("rung_floor"):
         impl = conn.execute(
             "SELECT * FROM runs WHERE step_id=? AND task_idx=? AND cycle=? AND role='implementer' "
             "AND status IN ('DONE','FAILED') ORDER BY id DESC LIMIT 1",
@@ -523,11 +563,13 @@ def dispatch_repair(ctx, conn, step, findings, pos):
     # alone forced a trip into artifact dirs to learn why (owner finding).
     why = " — " + (findings or "").strip().splitlines()[0][:160] if findings else ""
     run = dispatch(ctx, conn, step, "repair", prompt, d["task_wt"],
-                   "REPAIRING", f"repair rung {pos + 1}{why}",
+                   "REPAIRING", f"repair round {pos + 1}{why}",
                    model=model, effort=effort, resume_session=resume_session)
+    burned = d.get("burned", 0)
     tgm.notify(conn, ctx, f"repair:{run['key']}",
-               f"🛠 {step_label(step)} repair rung {pos + 1}/{LADDER_MAX} started "
-               f"({model}{', resumed session' if resume_session else ''})"
+               f"🛠 {step_label(step)} repair round {pos + 1} started "
+               f"({model}{', resumed session' if resume_session else ''}"
+               + (f", {burned}/{LADDER_MAX} hard-failed" if burned else "") + ")"
                + (f"\nfixing: {why[3:]}" if why else ""))
 
 
@@ -536,8 +578,9 @@ def dispatch_diagnostic(ctx, conn, step, findings):
     scfg = step_cfg(roadmap, step["id"])
     if not gate(ctx, conn, "diagnostic", route_model(scfg, "diagnostic")[0]):
         return
+    step = db.get_step(conn, step["id"])  # fresh: never write back stale detail
     d = db.step_detail(step)
-    d["diagnosed"] = True
+    d["diag_round"] = ladder_rounds(conn, step, d)  # one diagnostic per 3-round window
     db.set_detail(conn, step["id"], d)
     ws = Path(repo_cfg(roadmap, current_repo(ctx, step))["workspace"])
     head = gitops.current_sha(Path(d["task_wt"]))
@@ -671,7 +714,7 @@ def start_task_impl(ctx, conn, roadmap, step, task_idx=None):
     if not base or d.get("task_branch") != branch:
         base = integration_sha(roadmap, repo)
     d.update(task_idx=idx, task_base=base, task_branch=branch, task_wt=str(wt),
-             diagnosed=False)
+             burned=0, burn_mark=None, rung_floor=0, diag_round=0)
     db.set_detail(conn, step["id"], d)
     if not wt.exists():
         gitops.worktree_add(ws, wt, branch, base)
@@ -818,12 +861,15 @@ def enter_validation(ctx, conn, roadmap, step):
         status, new_sha = cherry_pick_x(ws, sha)
         if status == "conflict":
             db.event(conn, ctx, "cherry_conflict", step_id=step["id"], sha=sha)
+            # the work was fine; integration moved underneath it — environment
+            # drift, not a failed attempt (the fuse still bounds repeats)
             repair_or_block(ctx, conn, step,
                             f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}: "
                             "integration advanced under this task. Re-apply the change as new "
                             "commits that apply cleanly on the current integration content; if "
                             "that is impossible from this worktree, report status failed "
-                            "(the owner can /retry to re-plan from the new tip)")
+                            "(the owner can /retry to re-plan from the new tip)",
+                            progressed=True)
             return
         if status == "ok":
             record(sha, new_sha)
@@ -1148,6 +1194,8 @@ def step_advance_error(ctx, conn, step_id, exc):
                    f"x{streak}: {exc!r:.160} — other steps unaffected; "
                    f"blocks this step at x{STEP_ERR_BLOCK_AT}. /why {step_id}")
     if streak >= STEP_ERR_BLOCK_AT and step["state"] not in common.HALT_STATES:
+        d.pop("last_findings", None)  # stale findings must not steer a warm
+        db.set_detail(conn, step_id, d)  # /retry into repair; re-enter at tests
         goto_blocked(ctx, conn, step,
                      f"controller error advancing this step x{streak}: "
                      f"{exc!r:.200} — fix the controller, then /retry. "
@@ -1242,11 +1290,14 @@ def redispatch_stage(ctx, conn, roadmap, step, run):
         start_task_impl(ctx, conn, roadmap, step)
     elif role == "repair":
         dispatch_repair(ctx, conn, step, d.get("last_findings", "(findings lost)"),
-                        db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0)))
+                        ladder_rounds(conn, step, d))
     elif role == "diagnostic":
-        d["diagnosed"] = False
+        d.pop("diag_round", None)  # lost diagnostic: let the window re-fire it
         db.set_detail(conn, step["id"], d)
-        repair_or_block(ctx, conn, step, d.get("last_findings", "(findings lost)"))
+        # progressed: the original failure already burned (or didn't); a LOST
+        # diagnostic is an interruption, never a fresh failed attempt
+        repair_or_block(ctx, conn, step, d.get("last_findings", "(findings lost)"),
+                        progressed=True)
     elif role == "test":
         if step["state"] == "VALIDATING":
             enter_validation(ctx, conn, roadmap, step)
@@ -1316,8 +1367,7 @@ def on_impl_like(ctx, conn, roadmap, step, run):
         d = db.step_detail(step)
         d["last_findings"] = findings
         db.set_detail(conn, step["id"], d)
-        dispatch_repair(ctx, conn, step, findings,
-                        db.ladder_pos(conn, step["id"], d.get("task_idx", 0), d.get("cycle", 0)))
+        dispatch_repair(ctx, conn, step, findings, ladder_rounds(conn, step, d))
         return
     if run["status"] == "FAILED":
         repair_or_block(ctx, conn, step,
@@ -1373,6 +1423,9 @@ def on_testing(ctx, conn, roadmap, step, run):
         # (step-02 burned its whole budget on exactly this).
         db.set_run_note(conn, ctx, run["id"], "no tests collected (exit 5)")
         cmds = repo_cfg(roadmap, current_repo(ctx, step))["tests"]
+        d = db.step_detail(step)
+        d.pop("last_findings", None)  # engine-config problem: a warm /retry
+        db.set_detail(conn, step["id"], d)  # must re-enter at TESTING, not repair
         goto_blocked(ctx, conn, step,
                      "test harness collected NO TESTS (exit code 5) — the "
                      f"roadmap.yaml test command(s) {json.dumps(cmds)} match "
@@ -1441,9 +1494,30 @@ def on_review(ctx, conn, roadmap, step, run):
             if verdict == "PASS":
                 enter_validation(ctx, conn, roadmap, step)
             elif verdict == "REPAIR":
-                repair_or_block(ctx, conn, step,
-                                "REVIEW FINDINGS:\n" + json.dumps(obj["findings"], indent=1)[:4000])
+                gating = [f for f in obj["findings"] if not isinstance(f, dict)
+                          or f.get("severity") in ("critical", "major")]
+                if not gating:
+                    # severity is a promotion gate: minor/info-only REPAIR is
+                    # advisory — promote with notes instead of burning rounds
+                    # on polish the acceptance bar does not require
+                    db.event(conn, ctx, "review_advisory", step_id=step["id"], n=nf)
+                    tgm.notify(conn, ctx, f"advisory:{run['key']}",
+                               f"🔍 {step_label(step)} all {nf} finding(s) "
+                               "minor/info — advisory only; promoting "
+                               "(notes stay in the review artifact)")
+                    enter_validation(ctx, conn, roadmap, step)
+                else:
+                    # a repair that reached green tests and an independent
+                    # review did real work; NEW findings are progress, not a
+                    # burned attempt
+                    repair_or_block(ctx, conn, step,
+                                    "REVIEW FINDINGS:\n"
+                                    + json.dumps(obj["findings"], indent=1)[:4000],
+                                    progressed=True)
             else:
+                d["last_findings"] = ("REVIEW BLOCK:\n"
+                                      + json.dumps(obj["findings"], indent=1)[:4000])
+                db.set_detail(conn, step["id"], d)
                 goto_blocked(ctx, conn, step,
                              "reviewer BLOCK: " + json.dumps(obj["findings"])[:300])
             return
@@ -1538,9 +1612,11 @@ def step_line(conn, s) -> str:
         n = d.get("tasks_n", 0)
         if n > 1 and st in ACTIVE_TASK_STATES:
             bits.append(f"task {d.get('task_idx', 0) + 1}/{n}")
-        pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
-        if pos:
-            bits.append(f"attempt {pos}/{LADDER_MAX}")
+        rounds = ladder_rounds(conn, s, d)
+        if rounds:
+            bits.append(f"round {rounds}")
+        if d.get("burned"):
+            bits.append(f"{d['burned']}/{LADDER_MAX} hard-failed")
         if d.get("cycle"):
             bits.append(f"retry {d['cycle']}")
         if st == "SOAKING" and s["soak_until"]:
@@ -1783,6 +1859,10 @@ def why_text(ctx, conn, step_id=None) -> str:
     d = db.step_detail(step)
     cycle = d.get("cycle", 0)
     lines = [f"why {step['id']} — [{step['state']}] cycle {cycle} — {step['title']}"]
+    if d.get("task_wt"):
+        lines.append(f"ladder: round {ladder_rounds(conn, step, d)} this grant · "
+                     f"{d.get('burned', 0)}/{LADDER_MAX} hard-failed · "
+                     f"fuse {ctx.getenv('EC_LADDER_TOTAL_MAX', str(LADDER_TOTAL_MAX))} rounds")
     for t in conn.execute(
             "SELECT * FROM transitions WHERE step_id=? ORDER BY id DESC LIMIT 3",
             (step["id"],)).fetchall()[::-1]:
@@ -1808,13 +1888,35 @@ def why_text(ctx, conn, step_id=None) -> str:
 
 
 def rearm_step(ctx, conn, step) -> str:
-    d = {"cycle": db.step_detail(step).get("cycle", 0) + 1}
+    d = db.step_detail(step)
+    wt = d.get("task_wt")
+    if step["plan_path"] and wt and Path(wt).exists():
+        # Warm resume: the cycle's plan, worktree and every commit survive a
+        # BLOCK — /retry refreshes the failure budget and continues in-place
+        # (at repair when findings are known, else re-proving from tests)
+        # instead of replanning from scratch (owner finding 2026-08-10).
+        cyc = d.get("cycle", 0)
+        d.update(burned=0, burn_mark=None, diag_round=0,
+                 rung_floor=db.ladder_pos(conn, step["id"],
+                                          d.get("task_idx", 0), cyc))
+        d.pop("advance_err_streak", None)
+        db.set_detail(conn, step["id"], d)
+        with conn:
+            conn.execute("UPDATE steps SET active_run_id=NULL WHERE id=?",
+                         (step["id"],))
+        to = "REPAIRING" if d.get("last_findings") else "TESTING"
+        db.transition(conn, ctx, step["id"], to,
+                      "/retry — warm resume, budget refreshed")
+        return (f"{step['id']} resuming in-place at "
+                f"{'repair' if to == 'REPAIRING' else 'tests'} — "
+                f"{d['rung_floor']} round(s) of work kept, budget refreshed")
+    d = {"cycle": d.get("cycle", 0) + 1}
     db.set_detail(conn, step["id"], d)
     with conn:
         conn.execute("UPDATE steps SET active_run_id=NULL, plan_path=NULL WHERE id=?",
                      (step["id"],))
     db.transition(conn, ctx, step["id"], "PENDING", "/retry — fresh cycle")
-    return f"{step['id']} re-armed (cycle {d['cycle']})"
+    return f"{step['id']} re-armed from scratch (cycle {d['cycle']})"
 
 
 def help_text() -> str:
@@ -1823,7 +1925,8 @@ def help_text() -> str:
         "/status — roadmap, plan, usage, every step\n"
         "/workers — live workers + recent runs\n"
         "/why [step] — failure story (default: last halted)\n"
-        "/retry [step] — re-arm BLOCKED/ABORTED steps\n"
+        "/retry [step] — resume BLOCKED/ABORTED steps in-place (work kept; "
+        "replans from scratch only when the worktree is gone)\n"
         "/abort [step] — stop a step for good (dependents halt)\n"
         "/pause · /resume — dispatch gate (running workers finish)\n"
         "/prs — GitHub PRs for validated work\n"

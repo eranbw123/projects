@@ -221,7 +221,7 @@ class TestNotificationContext(unittest.TestCase):
                            "'blocked:a1%'").fetchone()["text"]
         self.assertIn("BLOCKED", txt)
         self.assertIn("boom reason", txt)
-        self.assertIn("attempts 0/4", txt)
+        self.assertIn("round 0 · hard-failed 0/4", txt)
         self.assertIn("stalls: b1", txt)
         self.assertIn("/retry a1", txt)
         conn.close()
