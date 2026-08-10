@@ -59,12 +59,17 @@ python control.py install-task   # install the once-per-minute tick task
 python control.py uninstall-task
 ```
 
-Telegram commands: `/status /workers /pause /resume /log /prs`, `/retry [step-id]`
-(`/workers` shows each live worker's role, elapsed time, deadline, process
-liveness, and statusline heartbeat — and, when idle, the reason nothing runs),
-(re-arm BLOCKED steps), `/abort [step-id]` (abort one step; its dependents
-never start; independent branches continue), `/profile auto|max5|max20|pro`
-(capacity override — debug only), `/pace auto|economy|balanced|sprint`.
+Telegram commands: `/status /workers /why /help /pause /resume /log /prs`,
+`/retry [step-id]` (re-arm BLOCKED steps), `/abort [step-id]` (abort one step;
+its dependents never start; independent branches continue),
+`/profile auto|max5|max20|pro` (capacity override — debug only),
+`/pace auto|economy|balanced|sprint`. `/workers` shows each live worker's
+role, elapsed time, deadline, process liveness, and heartbeat — and, when
+idle, the reason nothing runs. `/why [step]` narrates a step's failure story.
+Unknown slash commands answer with a `/help` pointer. Event notifications
+lead with a semantic emoji (▶️ start, 📋 plan, 🔨 built, 🧪/❌ tests, 🔍
+review, 🛠 repair, 📦 promoted, ☑️ task done, ✅ accepted, ⛔ blocked) and
+carry attempt/retry counts, durations, commit counts, and roadmap progress.
 
 Commands answer within a few seconds: a long-poll listener
 (`tg_listener.py`, supervised by the `engine-control-listener` task) wakes

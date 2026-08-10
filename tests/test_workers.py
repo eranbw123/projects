@@ -25,6 +25,16 @@ class TestCommandRegistered(unittest.TestCase):
     def test_workers_passes_the_telegram_whitelist(self):
         self.assertIn("/workers", telegram.COMMANDS)
 
+    def test_every_handled_command_passes_the_telegram_whitelist(self):
+        # A handler missing from telegram.COMMANDS is silently dropped by
+        # consume() as 'ignored' — bit /workers once and /why twice.
+        import inspect
+        import re
+        src = inspect.getsource(control.handle_commands)
+        handled = set(re.findall(r'name == "(/\w+)"', src))
+        self.assertTrue(handled, "handler source no longer matches pattern")
+        self.assertEqual(set(), handled - set(telegram.COMMANDS))
+
 
 def running_probe(ctx, run):
     return {"phase": "running", "rc": None}
@@ -167,6 +177,94 @@ class TestIdleReason(Base):
         self.assertIn("0 active", txt)
         self.assertIn("idle — PAUSED", txt)
         self.assertIn("/workers", txt)
+        conn.close()
+
+
+DEP_STEPS = """
+steps:
+  - id: a1
+    ordinal: 1
+    title: step a
+    repos: [canary]
+    depends_on: []
+    objective: obj a
+    acceptance: acc a
+  - id: b1
+    ordinal: 2
+    title: step b
+    repos: [canary]
+    depends_on: [a1]
+    objective: obj b
+    acceptance: acc b
+"""
+
+
+class TestNotificationContext(unittest.TestCase):
+    """Owner-facing messages carry their try/retry/dependency context.
+
+    Regression anchor (2026-08-10): 'step started' and friends reported the
+    event with no metadata — the owner could not tell a first try from a
+    last chance, nor what a BLOCK stalled downstream."""
+
+    def setUp(self):
+        self.sb = Sandbox(steps_yaml=DEP_STEPS)
+        self.sb.tick()
+
+    def tearDown(self):
+        self.sb.cleanup()
+
+    def test_blocked_message_names_attempts_stalls_and_actions(self):
+        conn = self.sb.conn()
+        control.goto_blocked(self.sb.ctx(), conn,
+                             self.sb.step_row(conn, "a1"), "boom reason")
+        txt = conn.execute("SELECT text FROM notifications WHERE key LIKE "
+                           "'blocked:a1%'").fetchone()["text"]
+        self.assertIn("BLOCKED", txt)
+        self.assertIn("boom reason", txt)
+        self.assertIn("attempts 0/4", txt)
+        self.assertIn("stalls: b1", txt)
+        self.assertIn("/retry a1", txt)
+        conn.close()
+
+    def test_status_shows_dependency_waits_and_ready(self):
+        conn = self.sb.conn()
+        txt = control.status_text(self.sb.ctx(), conn)
+        self.assertIn("a1 READY", txt)       # no unmet deps
+        self.assertIn("waits a1", txt)       # b1 gated on a1
+        conn.close()
+
+    def test_accepted_message_carries_progress_and_unblocks(self):
+        conn = self.sb.conn()
+        db.transition(conn, self.sb.ctx(), "a1", "ACCEPTED", "test")
+        txt = control.accepted_text(conn, self.sb.step_row(conn, "a1"))
+        self.assertIn("a1 ACCEPTED", txt)
+        self.assertIn("roadmap 1/2 accepted", txt)
+        self.assertIn("unblocks: b1", txt)
+        conn.close()
+
+    def test_quota_message_carries_streak_and_retry_time(self):
+        conn = self.sb.conn()
+        control.wait_quota(self.sb.ctx(), conn, self.sb.step_row(conn, "a1"))
+        txt = conn.execute("SELECT text FROM notifications WHERE key LIKE "
+                           "'quota:a1%'").fetchone()["text"]
+        self.assertIn("hit 1", txt)
+        self.assertIn("resumes automatically", txt)
+        conn.close()
+
+    def test_help_and_unknown_command_get_replies(self):
+        conn = self.sb.conn()
+        sent = []
+
+        class T:
+            def send(self, t):
+                sent.append(t)
+
+        control.handle_commands(self.sb.ctx(), conn, T(), ["/help"])
+        self.assertIn("/why", sent[-1])
+        self.assertIn("/retry", sent[-1])
+        control.handle_commands(self.sb.ctx(), conn, T(), ["/bogus"])
+        self.assertIn("unknown command /bogus", sent[-1])
+        self.assertIn("/help", sent[-1])
         conn.close()
 
 

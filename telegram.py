@@ -24,7 +24,7 @@ SETUP_HELP = (
 )
 
 COMMANDS = ("/status", "/workers", "/pause", "/resume", "/retry", "/abort",
-            "/log", "/profile", "/pace", "/prs")
+            "/log", "/profile", "/pace", "/prs", "/why", "/help", "/start")
 
 
 class Telegram:
@@ -98,8 +98,11 @@ def consume(ctx, conn, tg: Telegram) -> list[str]:
             with conn:
                 conn.execute("UPDATE tg_updates SET status='unauthorized' WHERE update_id=?", (uid,))
             continue
+        # Any slash command from the authorized chat reaches the handler:
+        # unknown ones get a /help pointer instead of vanishing (typos used
+        # to be recorded as 'ignored' with no feedback at all).
         first = text.split()[0].split("@")[0] if text else ""
-        if first in COMMANDS:
+        if first.startswith("/"):
             cmds.append(text)
             with conn:
                 conn.execute("UPDATE tg_updates SET status='command' WHERE update_id=?", (uid,))

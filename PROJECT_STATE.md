@@ -54,13 +54,29 @@ fallback only) + last tool name (metadata only, never transcript content).
 When idle it names the operative gate in tick order: not started / PAUSED
 (kv `paused_why`: set by /pause, CLI pause, auto-pause; empty = direct kv
 write, reported as maintenance) / quota hold / target 0 / no READY steps.
-/status: idle reason line when 0 active; run lines show elapsed + activity
-age; in-flight multi-task steps show `task i/n` (PRs open per validated
-task, so a step legitimately keeps running after its first PR).
-`step_label()` puts the same 1-based `(task i/n)` on every task-scoped
-notification (review verdict, repair, tests, validation, quota, blocked,
-task-done "step continues") and on /workers run lines; single-task plans
-stay a bare step id. tests/test_workers.py (9).
+/status: progress header (`RUNNING · a/n accepted`), per-step lines via
+`step_line()` — READY vs `waits dep+dep` for PENDING, `task i/n`,
+`attempt i/4` (ladder_pos), `retry k` (cycle), time-in-state, soak/quota
+timers; run lines show elapsed + activity age (PRs open per validated task,
+so a step legitimately keeps running after its first PR). `step_label()`
+puts the same 1-based `(task i/n)` on every task-scoped notification;
+single-task plans stay a bare step id.
+
+## Notification grammar (2026-08-10)
+Owner asked: every message carries its context, not just the event. Emoji
+headline (▶️📋🔨🧪❌🔍🛠📦☑️✅⏳⌛⛔🔌🔁⚠) + detail lines + context tail via
+`attempts_note` (attempt i/4 · retry k), `roadmap_note` (a/n accepted),
+`dependents_of` (BLOCKED names stalls:, ACCEPTED names unblocks: among
+now-READY), `accepted_text` (tasks/commits/attempts/duration). tests-FAILED
+carries `_fail_hits` lines; review verdicts carry `_findings_lines`
+(severity: issue); plan-ready lists task objectives; repair says what it
+fixes + model/resumed; quota shows usage% + absolute retry time;
+planner/reviewer/audit retries notify (were silent). "engine-control:"
+prefix dropped — dedicated bot chat. /help (+/start alias) lists commands;
+unknown slash cmds answer with a /help pointer (consume forwards any "/");
+/why whitelisted (was handled but dropped by consume — unreachable); tg /log
+renders events human (`_fmt_event`), CLI log stays raw. tests:
+test_workers.py (16), test_flow TestValidatorGate pins fail-lines+attempt.
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied

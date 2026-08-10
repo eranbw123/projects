@@ -203,6 +203,11 @@ class TestValidatorGate(FlowBase):
                             ).fetchone()
         conn.close()
         self.assertIsNotNone(note)
+        # the push carries the attempt position and the actual failing lines
+        # (owner finding 2026-08-10: bare 'tests FAILED' forced a /why trip)
+        self.assertIn("attempt 1/4", note["text"])
+        self.assertGreater(len(note["text"].splitlines()), 1,
+                           "failing test lines missing from the notification")
 
 
 class TestReviewerGate(FlowBase):
