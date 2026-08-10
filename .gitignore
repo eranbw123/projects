@@ -8,5 +8,7 @@ telemetry/
 backups/
 automation-settings.json
 tick.lock
+listener.lock
+listener.alive
 __pycache__/
 *.pyc

@@ -49,6 +49,7 @@ python control.py doctor          # environment/config health check
 python control.py init           # clone workspaces, create automation/integration
 python control.py start          # START THE ROADMAP (the tick drives it after this)
 python control.py status         # roadmap + step + active-run overview
+python control.py workers        # live workers: liveness, heartbeat, idle reason
 python control.py pause          # stop dispatching (running workers finish)
 python control.py resume         # resume dispatching
 python control.py retry          # re-arm a BLOCKED step (fresh cycle)
@@ -58,10 +59,18 @@ python control.py install-task   # install the once-per-minute tick task
 python control.py uninstall-task
 ```
 
-Telegram commands: `/status /pause /resume /log`, `/retry [step-id]` (re-arm
-BLOCKED steps), `/abort [step-id]` (abort one step; its dependents never
-start; independent branches continue), `/profile auto|max5|max20|pro`
+Telegram commands: `/status /workers /pause /resume /log /prs`, `/retry [step-id]`
+(`/workers` shows each live worker's role, elapsed time, deadline, process
+liveness, and statusline heartbeat — and, when idle, the reason nothing runs),
+(re-arm BLOCKED steps), `/abort [step-id]` (abort one step; its dependents
+never start; independent branches continue), `/profile auto|max5|max20|pro`
 (capacity override — debug only), `/pace auto|economy|balanced|sprint`.
+
+Commands answer within a few seconds: a long-poll listener
+(`tg_listener.py`, supervised by the `engine-control-listener` task) wakes
+the controller the moment an update arrives. If the listener dies, its
+heartbeat goes stale and commands transparently fall back to the 1-minute
+tick cadence until the supervisor restarts it (≤5 min).
 
 ## Telegram setup (required before the roadmap runs)
 
@@ -74,6 +83,36 @@ The controller uses its OWN bot — never the product discovery bot.
 
 Until configured, steps sit in `WAITING_CONFIG` (nothing crashes, nothing is
 lost); the tick picks credentials up automatically.
+
+## GitHub visibility (automatic PRs)
+
+Every time a task passes integration tests, the controller records that
+validated `automation/integration` tip and — in a dedicated tick phase
+(`ghpr.pr_sync`) — pushes exactly that commit to GitHub and keeps ONE open
+pull request per repo (head `automation/integration`, base `pr_base:` from
+`roadmap.yaml`, falling back to the repo's default branch if that branch
+disappears). The PR body is regenerated from `state.db` each push: baseline,
+last validated push, and a per-step table (state, commit count, last
+integration). Telegram announces PR opening and every push, with links;
+`/prs` lists current PRs on demand.
+
+Semantics worth knowing:
+
+- Only VALIDATED work is pushed — never the live integration tip while a
+  validation run is still in flight, never repair-in-progress states.
+- The push target is an explicit `https://github.com/<owner>/<repo>.git` URL
+  derived from the owner repo's `origin`; clones still carry the invalid
+  `DISABLED:` push URL, so workers cannot push under any condition. The
+  `gitops.assert_safe` guard applies unchanged (no main/master, no force, no
+  deletion) — merging the PR is always a human action on GitHub.
+- A merged/closed PR is left alone until the NEXT validated work lands, then
+  a fresh PR opens automatically. A repo without a GitHub origin is skipped
+  silently. GitHub being down events + notifies once per tip and retries
+  every 10 minutes — it never pauses development and never trips the
+  controller error streak.
+- Requirements: GitHub CLI installed and authenticated (`gh auth login`,
+  `repo` scope) — `python control.py doctor` verifies both and shows each
+  repo's PR target. `EC_GH_EXE` overrides gh discovery if needed.
 
 ## Recovery
 
@@ -99,7 +138,8 @@ Manual reboot acceptance procedure: `tests/MANUAL_REBOOT_TEST.md`.
   rewriting, `-C`/`--git-dir` redirection, and any mutating invocation
   (including worktree/branch/remote/config write forms) outside the
   automation roots. Push URLs of clones are additionally set to an invalid
-  `DISABLED:` URL.
+  `DISABLED:` URL; the controller's own GitHub pushes go through
+  `gitops.push_url` (explicit URL, validated-tip-only, same guard).
 - Claude workers are permission-scoped to specific git verbs (status, add,
   commit, diff, log, show, rev-parse, ls-files, grep, rm) — no push, no
   branch, no remote, no worktree, no config. Acceptance additionally verifies

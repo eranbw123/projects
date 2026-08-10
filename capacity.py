@@ -353,24 +353,37 @@ def maybe_dispatch_probe(ctx, conn, view) -> bool:
     quota hits are the hard backstop — the probe is never relied upon."""
     if ctx.getenv("EC_DISABLE_PROBE") == "1":
         return False
-    if view.get("confidence") not in ("conflict", "conservative_fallback") \
-            and view.get("tier") not in ("max_unknown", "unknown") \
-            and not view.get("contested"):
+    unresolved = (view.get("confidence") in ("conflict", "conservative_fallback")
+                  or view.get("tier") in ("max_unknown", "unknown"))
+    if not unresolved and not view.get("contested"):
         return False
     if not auth_ok(view):
         return False
     hold = db.kv_get(conn, "quota_hold_until")
     if hold and not common.is_past(hold):
         return False
+    # Pacing is deliberately SIGNATURE-INDEPENDENT: every claude -p session
+    # (including the probe itself) rewrites .claude.json bookkeeping, so a
+    # sig-keyed episode resets itself and probes would fire every tick
+    # (observed live). The global timestamp + daily cap cannot be reset by
+    # evidence churn. Contested-but-operational detection probes hourly;
+    # genuinely unresolved capacity probes every PROBE_MIN_INTERVAL_MIN.
+    last = db.kv_get(conn, "probe_last_at")
+    interval = PROBE_MIN_INTERVAL_MIN if unresolved else 60
+    if last and _age_min(last) < interval:
+        return False
+    day_count = conn.execute(
+        "SELECT COUNT(*) c FROM runs WHERE role='probe' AND created_at > ?",
+        (common.iso_in(-24 * 3600),)).fetchone()["c"]
+    if day_count >= 24:
+        return False
     ep = json.loads(db.kv_get(conn, "probe_episode") or "{}")
     if ep.get("sig") != view.get("sig"):
-        ep = {"sig": view.get("sig"), "count": 0, "last": None}
+        ep = {"sig": view.get("sig"), "count": 0, "last": ep.get("last")}
     if ep["count"] >= PROBE_EPISODE_CAP:
         if _age_min(ep.get("last")) < PROBE_EPISODE_HOLD_H * 60:
             return False
-        ep = {"sig": view.get("sig"), "count": 0, "last": None}
-    if ep.get("last") and _age_min(ep["last"]) < PROBE_MIN_INTERVAL_MIN:
-        return False
+        ep = {"sig": view.get("sig"), "count": 0, "last": ep.get("last")}
     open_probe = conn.execute(
         "SELECT 1 FROM runs WHERE role='probe' AND status IN ('PREPARED','DISPATCHED')"
     ).fetchone()
@@ -397,6 +410,7 @@ def maybe_dispatch_probe(ctx, conn, view) -> bool:
         ep["count"] += 1
         ep["last"] = common.now()
         db.kv_set(conn, "probe_episode", json.dumps(ep))
+        db.kv_set(conn, "probe_last_at", common.now())
         db.event(conn, ctx, "capacity_probe", key=key, count=ep["count"])
         return True
     except Exception as e:
@@ -486,6 +500,13 @@ def ingest_telemetry(ctx, conn) -> int:
             "pct7": obj.get("pct7"), "reset7": obj.get("reset7"),
             "model": obj.get("model"),
         })
+    cutoff = now_dt().timestamp() - 10 * 86400
+    for f in files:
+        try:  # one file per session id, forever — prune abandoned sessions
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
     for r in rows:
         r["pct5"], r["pct7"] = _num(r.get("pct5")), _num(r.get("pct7"))
         if r.get("pct5") is None and r.get("pct7") is None:

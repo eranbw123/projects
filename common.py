@@ -119,11 +119,11 @@ class Ctx:
             pass
 
 
-def acquire_lock(root: Path):
+def acquire_lock(root: Path, name: str = "tick.lock"):
     """Single-instance lock. OS releases the byte lock when the process dies,
-    so a crashed tick can never wedge the controller."""
+    so a crashed holder can never wedge its successor."""
     import msvcrt
-    f = open(root / "tick.lock", "a+b")
+    f = open(root / name, "a+b")
     try:
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
@@ -204,5 +204,8 @@ def load_schema(name: str) -> dict:
     return json.loads((CODE_DIR / "schemas" / name).read_text(encoding="utf-8"))
 
 
-def tail(text: str, lines: int = 60) -> str:
-    return "\n".join(text.splitlines()[-lines:])
+def tail(text: str | None, lines: int = 60) -> str:
+    # None-tolerant on purpose: callers feed it subprocess output and JSON
+    # fields, both of which can legitimately be missing (the 2026-08-10
+    # controller stall was one None reaching a .splitlines()).
+    return "\n".join((text or "").splitlines()[-lines:])

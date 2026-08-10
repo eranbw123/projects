@@ -12,13 +12,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import traceback
 from pathlib import Path
 
 import capacity as cap
 import claude_runner as cr
 import common
 import db
+import ghpr
 import gitops
 import telegram as tgm
 import validators as vd
@@ -405,7 +408,8 @@ def wait_quota(ctx, conn, step):
 def goto_blocked(ctx, conn, step, reason):
     db.transition(conn, ctx, step["id"], "BLOCKED", reason)
     tgm.notify(conn, ctx, f"blocked:{step['id']}:{db.step_detail(step).get('cycle',0)}",
-               f"engine-control: {step['id']} BLOCKED — {reason[:300]}\nUse /retry or /abort.")
+               f"engine-control: {step['id']} BLOCKED — {reason[:400]}\n"
+               f"Full history: /why {step['id']} · then /retry or /abort.")
 
 
 def repair_or_block(ctx, conn, step, findings: str):
@@ -447,8 +451,11 @@ def dispatch_repair(ctx, conn, step, findings, pos):
         "STEP_ID": step["id"], "OBJECTIVE": task_objective(ctx, step),
         "FINDINGS": findings, "RESULT_PATH": "<<RESULT_PATH>>",
         "RULES": worker_rules(ctx, step)})
+    # The rung transition carries WHAT is being repaired: "repair rung 2"
+    # alone forced a trip into artifact dirs to learn why (owner finding).
+    why = " — " + (findings or "").strip().splitlines()[0][:160] if findings else ""
     run = dispatch(ctx, conn, step, "repair", prompt, d["task_wt"],
-                   "REPAIRING", f"repair rung {pos + 1}",
+                   "REPAIRING", f"repair rung {pos + 1}{why}",
                    model=model, effort=effort, resume_session=resume_session)
     tgm.notify(conn, ctx, f"repair:{run['key']}",
                f"engine-control: {step['id']} repair started (rung {pos + 1}/{LADDER_MAX})")
@@ -971,13 +978,21 @@ def advance_all(ctx, conn, roadmap):
     ctx.gov = gov
     notify_plan_transition(ctx, conn, view)
 
-    # 1) advance in-flight steps, finishing work first, critical path first
+    # 1) advance in-flight steps, finishing work first, critical path first.
+    # Each step advances inside its own error boundary: a controller bug in
+    # ONE step's path must never stall every other step (the 2026-08-10
+    # stdout=None crash froze the whole roadmap for 6 ticks and the global
+    # streak paused dispatch — with the blast radius actually one step wide).
     active = [s for s in live
               if s["state"] != "PENDING" and s["state"] not in common.HALT_STATES]
     active.sort(key=lambda s: (STAGE_ORDER.get(s["state"], 8),
                                -weights.get(s["id"], 0), s["ordinal"]))
     for s in active:
-        advance_step(ctx, conn, roadmap, db.get_step(conn, s["id"]))
+        try:
+            advance_step(ctx, conn, roadmap, db.get_step(conn, s["id"]))
+            clear_step_advance_error(conn, s["id"])
+        except Exception as e:  # noqa: BLE001 — contained per step, loud below
+            step_advance_error(ctx, conn, s["id"], e)
 
     # 2) start new READY steps up to the dynamic concurrency target
     ready.sort(key=lambda s: (1 if s["background"] else 0,
@@ -996,6 +1011,43 @@ def advance_all(ctx, conn, roadmap):
             start_audit(ctx, conn, roadmap, step, new_step=True)
         else:
             start_planning(ctx, conn, roadmap, step, new_step=True)
+
+
+STEP_ERR_BLOCK_AT = 8   # ticks of repeated per-step controller error -> BLOCKED
+
+
+def step_advance_error(ctx, conn, step_id, exc):
+    """A controller bug advancing ONE step: record it with the step id and
+    traceback (the August stall was undiagnosable from `advance_error` events
+    that carried neither), notify early, and after STEP_ERR_BLOCK_AT ticks
+    block just this step — its dependents stop, everything else keeps moving."""
+    tb = traceback.format_exc()
+    step = db.get_step(conn, step_id)
+    d = db.step_detail(step)
+    streak = d.get("advance_err_streak", 0) + 1
+    d["advance_err_streak"] = streak
+    db.set_detail(conn, step_id, d)
+    ctx.log(f"advance error {step_id} x{streak}: {exc!r}\n" + common.tail(tb, 15))
+    db.event(conn, ctx, "advance_error", step_id=step_id,
+             err=repr(exc)[:300], streak=streak, tb=common.tail(tb, 10)[:1200])
+    if streak in (1, 5):
+        tgm.notify(conn, ctx, f"step-err:{step_id}:{streak}",
+                   f"engine-control: ⚠ controller error advancing {step_id} "
+                   f"x{streak}: {exc!r:.160} — other steps unaffected; "
+                   f"blocks this step at x{STEP_ERR_BLOCK_AT}. /why {step_id}")
+    if streak >= STEP_ERR_BLOCK_AT and step["state"] not in common.HALT_STATES:
+        goto_blocked(ctx, conn, step,
+                     f"controller error advancing this step x{streak}: "
+                     f"{exc!r:.200} — fix the controller, then /retry. "
+                     + common.tail(tb, 3))
+
+
+def clear_step_advance_error(conn, step_id):
+    step = db.get_step(conn, step_id)  # refetch: advance just rewrote detail
+    d = db.step_detail(step)
+    if "advance_err_streak" in d:
+        d.pop("advance_err_streak", None)
+        db.set_detail(conn, step_id, d)
 
 
 def advance_step(ctx, conn, roadmap, step):
@@ -1173,14 +1225,37 @@ def on_testing(ctx, conn, roadmap, step, run):
     if not obj:
         repair_or_block(ctx, conn, step, "test run produced no result artifact")
         return
+    report = common.tail(obj.get("report"), 60)
     if obj.get("passed"):
         tgm.notify(conn, ctx, f"tests:{run['key']}",
                    f"engine-control: {step['id']} tests green — review")
         start_review(ctx, conn, roadmap, step)
+    elif obj.get("no_tests"):
+        # Exit code 5 = the runner COLLECTED NOTHING. That is a roadmap.yaml
+        # test-command vs repo-layout mismatch, not broken code; repair
+        # workers cannot reach engine config, so spending rungs is pure waste
+        # (step-02 burned its whole budget on exactly this).
+        db.set_run_note(conn, ctx, run["id"], "no tests collected (exit 5)")
+        cmds = repo_cfg(roadmap, current_repo(ctx, step))["tests"]
+        goto_blocked(ctx, conn, step,
+                     "test harness collected NO TESTS (exit code 5) — the "
+                     f"roadmap.yaml test command(s) {json.dumps(cmds)} match "
+                     "nothing in the worktree. Fix the command or the layout; "
+                     "repair workers cannot fix engine config.\n" + report)
     else:
+        db.set_run_note(conn, ctx, run["id"],
+                        "tests failed: " + _fail_lines(report, 3))
         tgm.notify(conn, ctx, f"tests:{run['key']}",
                    f"engine-control: {step['id']} tests FAILED — repair path")
-        repair_or_block(ctx, conn, step, "tests failed:\n" + common.tail(obj.get("report", ""), 60))
+        repair_or_block(ctx, conn, step, "tests failed:\n" + report)
+
+
+def _fail_lines(report: str, n: int) -> str:
+    """First n lines that look like actual failures — the part of a test
+    report a human wants first."""
+    hits = [l.strip() for l in (report or "").splitlines()
+            if re.search(r"FAIL|ERROR|Error|error:|failed|rc=[1-9]", l)]
+    return " | ".join(hits[:n]) or (report or "").strip()[:200]
 
 
 def on_review(ctx, conn, roadmap, step, run):
@@ -1228,6 +1303,14 @@ def on_validating(ctx, conn, roadmap, step, run):
         repair_or_block(ctx, conn, step, "integration tests failed:\n"
                         + common.tail((obj or {}).get("report", "no artifact"), 60))
         return
+    # The only moment the integration tip is provably test-green (integration
+    # is serialized per repo, so the tip == what this run validated). ghpr
+    # pushes exactly this sha to GitHub — never the live unvalidated tip.
+    for rname, rcc in roadmap["repos"].items():
+        if Path(rcc["workspace"]).resolve() == Path(run["cwd"]).resolve():
+            db.kv_set(conn, f"pr_tip:{rname}",
+                      gitops.current_sha(Path(run["cwd"]), INTEGRATION))
+            break
     d = db.step_detail(step)
     idx = run["task_idx"]  # the task this validation run actually validated
     done = d.get("done_tasks", [])
@@ -1235,8 +1318,11 @@ def on_validating(ctx, conn, roadmap, step, run):
         done = sorted(done + [idx])
         d["done_tasks"] = done
         db.set_detail(conn, step["id"], d)
+        n = d.get("tasks_n", 1)
         tgm.notify(conn, ctx, f"task:{step['id']}:c{d.get('cycle',0)}t{idx}:done",
-                   f"engine-control: {step['id']} task {idx} integrated and validated")
+                   f"engine-control: {step['id']} task {idx} integrated and validated "
+                   f"({len(done)}/{n} tasks"
+                   + ("; step continues)" if len(done) < n else ")"))
     if len(done) < d.get("tasks_n", 1):
         step = db.get_step(conn, step["id"])
         start_task_impl(ctx, conn, roadmap, step, task_idx=len(done))
@@ -1257,11 +1343,7 @@ def status_text(ctx, conn) -> str:
     run_id = db.kv_get(conn, "roadmap_run_id") or "-"
     lines.append(f"engine-control — roadmap {'started' if started else 'NOT started'}"
                  f"{' [PAUSED]' if paused else ''} (run {run_id})")
-    view = json.loads(db.kv_get(conn, "capacity_state") or "{}")
-    usage = cap.current_usage(conn)
-    ready = [s["id"] for s in live_steps(conn) if step_ready(conn, s)]
-    gov = cap.governor(ctx, conn, view, usage,
-                       len([r for r in ready if not db.get_step(conn, r)["background"]]))
+    gov, ready, view, usage = gov_now(ctx, conn)
     mode = "auto" if not gov["override"] else f"override:{gov['override']}"
     lines.append(f"Plan: {TIER_LABEL.get(gov['tier'], gov['tier'])} "
                  f"({mode}, {view.get('confidence', '?')}) · auth {view.get('auth_mode', '?')}")
@@ -1272,22 +1354,238 @@ def status_text(ctx, conn) -> str:
     else:
         lines.append("Usage: no telemetry yet")
     lines.append(f"Claude workers: {gov['active']} active · target {gov['target']}"
-                 f" · pressure {gov['pressure']} · pace {gov['pace']}")
+                 f" · pressure {gov['pressure']} · pace {gov['pace']} (/workers)")
+    if gov["active"] == 0 and started:
+        lines.append(f"   idle — {idle_reason(conn, gov, ready)}")
+    prs = [f"{r['k'].split(':', 1)[1]} #{r['v']}" for r in
+           conn.execute("SELECT k,v FROM kv WHERE k LIKE 'pr_number:%' AND v!='' "
+                        "ORDER BY k")]
+    if prs:
+        lines.append("GitHub PRs: " + " · ".join(prs) + " (/prs for links)")
     if ready:
         lines.append(f"READY: {', '.join(ready)}")
     for s in conn.execute("SELECT * FROM steps ORDER BY ordinal"):
         d = db.step_detail(s)
         pos = db.ladder_pos(conn, s["id"], d.get("task_idx", 0), d.get("cycle", 0))
         mark = {"ACCEPTED": "✅", "BLOCKED": "⛔", "ABORTED": "🛑"}.get(s["state"], "·")
-        lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos} — {s['title']}")
+        n = d.get("tasks_n", 0)
+        prog = (f" · task {d.get('task_idx', 0) + 1}/{n}" if n > 1 and s["state"] in
+                ("IMPLEMENTING", "TESTING", "REPAIRING", "REVIEWING", "VALIDATING") else "")
+        lines.append(f"{mark} {s['id']} [{s['state']}] attempts={pos}{prog} — {s['title']}")
+        if s["state"] == "BLOCKED":
+            why = conn.execute(
+                "SELECT reason FROM transitions WHERE step_id=? AND to_state='BLOCKED' "
+                "ORDER BY id DESC LIMIT 1", (s["id"],)).fetchone()
+            if why and why["reason"]:
+                first = why["reason"].strip().splitlines()[0]
+                lines.append(f"   ⛔ {first[:150]}  (/why {s['id']})")
         if s["active_run_id"]:
             r = db.get_run(conn, s["active_run_id"])
             if r and r["status"] in ("PREPARED", "DISPATCHED"):
+                hb, _ = _worker_activity(ctx, r)
                 lines.append(f"   run {r['key']} ({r['role']}/{r['model']}) "
+                             f"{_mins_between(r['created_at'], common.now()) or 0}m"
+                             f"{'' if hb is None else f' · active {hb}m ago'} "
                              f"since {common.local_str(r['created_at'], '%m-%d %H:%M')}")
     if not tgm.from_ctx(ctx):
         lines.append("⚠ telegram: WAITING_CONFIG (see README)")
     return "\n".join(lines)
+
+
+def _run_outcome(conn, run) -> str:
+    """One line saying what a run actually did — derived from its result
+    artifact so it works for runs recorded before notes existed."""
+    if run["status"] in ("FAILED", "QUOTA", "LOST"):
+        return f"{run['status']}: {(run['note'] or '').strip()[:160]}"
+    obj = common.read_json(Path(run["artifact_dir"]) / "result.json") or {}
+    role = run["role"]
+    if role == "test":
+        if obj.get("passed"):
+            return "tests green"
+        if obj.get("no_tests"):
+            return "NO TESTS COLLECTED (exit 5) — command/layout mismatch"
+        if obj:
+            return "tests failed: " + _fail_lines(obj.get("report") or "", 2)[:200]
+        return run["note"] or "no result artifact"
+    if role in ("implementer", "repair"):
+        if obj.get("status") == "done":
+            return "done: " + (obj.get("summary") or "")[:160]
+        return f"reported {obj.get('status', '?')}: {(obj.get('summary') or '')[:160]}"
+    if role in ("reviewer", "diagnostic", "audit"):
+        v = obj.get("verdict") or obj.get("status") or "?"
+        n = len(obj.get("findings") or [])
+        return f"{v}, {n} finding(s)" if obj else (run["note"] or "no artifact")
+    if role == "planner":
+        return f"plan with {len(obj.get('tasks', []))} task(s)" if obj else "no plan artifact"
+    return (run["note"] or obj.get("summary") or "").strip()[:160] or run["status"]
+
+
+def _mins_between(a_iso, b_iso):
+    try:
+        return int((common.parse_iso(b_iso) - common.parse_iso(a_iso)).total_seconds() // 60)
+    except (ValueError, TypeError):
+        return None
+
+
+def _worker_activity(ctx, run):
+    """(age_min, doing) — freshest liveness signal for a worker session.
+    Primary: the CLI's session transcript (~/.claude/projects/*/<sid>.jsonl),
+    appended on every message even in headless -p mode (verified live; the
+    statusline never fires headless, so telemetry/sessions alone would read
+    'no heartbeat' forever). Statusline file kept as a fallback for any
+    interactive session. `doing` is metadata only — last tool name(s) /
+    message direction, never transcript content (owner-visible surface)."""
+    sid = json.loads(run["external"] or "{}").get("session")
+    if not sid:
+        return None, None
+    import time as _t
+    ages, doing = [], None
+    base = Path(ctx.getenv("EC_CLAUDE_PROJECTS")
+                or Path.home() / ".claude" / "projects")
+    hits = list(base.glob(f"*/{sid}.jsonl"))
+    if hits:
+        p = max(hits, key=lambda q: q.stat().st_mtime)
+        lines = []
+        try:
+            ages.append((_t.time() - p.stat().st_mtime) / 60)
+            with open(p, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 65536))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            pass
+        for line in reversed(lines):
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") == "assistant":
+                names = [c.get("name") for c in
+                         ((o.get("message") or {}).get("content") or [])
+                         if isinstance(c, dict) and c.get("type") == "tool_use"]
+                doing = ("tool: " + ",".join(n for n in names if n)
+                         if any(names) else "writing")
+                break
+            if o.get("type") == "user":
+                doing = "reading tool result"
+                break
+    obj = common.read_json(ctx.root / "telemetry" / "sessions" / f"{sid}.json")
+    if obj and obj.get("ts"):
+        a = _mins_between(obj["ts"], common.now())
+        if a is not None:
+            ages.append(a)
+    return (max(0, int(min(ages))) if ages else None), doing
+
+
+def gov_now(ctx, conn):
+    """This tick's governor view + READY step ids (shared by /status, /workers)."""
+    view = json.loads(db.kv_get(conn, "capacity_state") or "{}")
+    usage = cap.current_usage(conn)
+    ready = [s["id"] for s in live_steps(conn) if step_ready(conn, s)]
+    gov = cap.governor(ctx, conn, view, usage,
+                       len([r for r in ready if not db.get_step(conn, r)["background"]]))
+    return gov, ready, view, usage
+
+
+def idle_reason(conn, gov, ready) -> str:
+    """Why zero workers are running — checked in the order the tick gates
+    dispatch, so the first true condition is the operative one."""
+    if db.kv_get(conn, "roadmap_started") != "1":
+        return "roadmap not started (python control.py start)"
+    if db.kv_get(conn, "paused") == "1":
+        why = db.kv_get(conn, "paused_why") or \
+            "paused directly in state.db (maintenance edit window?)"
+        return f"PAUSED: {why} — /resume to continue"
+    hold = db.kv_get(conn, "quota_hold_until")
+    if hold and not common.is_past(hold):
+        return f"quota hold until {common.local_str(hold)}"
+    if gov["target"] == 0:
+        return f"dispatch target 0 (pressure {gov['pressure']})"
+    if not ready:
+        return "no READY steps (waiting on dependencies, soak, or retry timers)"
+    return "dispatch expected next tick"
+
+
+def workers_text(ctx, conn, probe=None) -> str:
+    """Live answer to 'what are the workers doing right now': every open run
+    with process liveness (probe) + statusline heartbeat age, the idle reason
+    when nothing runs, and the last few finished runs with outcomes."""
+    probe = probe or cr.probe
+    runs = [r for r in db.open_runs(conn) if r["role"] != "probe"]
+    lines = [f"workers: {len(runs)} active"]
+    for r in runs:
+        phase = probe(ctx, r)["phase"]
+        el = _mins_between(r["created_at"], common.now()) or 0
+        left = _mins_between(common.now(), r["deadline"]) if r["deadline"] else None
+        dl = "" if left is None else (f" · {left}m to deadline" if left >= 0
+                                      else f" · {-left}m OVERDUE")
+        hb, doing = _worker_activity(ctx, r)
+        hbs = ("local (no session)" if r["role"] == "test"
+               else "no heartbeat yet" if hb is None else f"active {hb}m ago")
+        if doing and r["role"] != "test":
+            hbs += f" · {doing}"
+        who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+        step = db.get_step(conn, r["step_id"])
+        lines.append(f"• {r['step_id']} {who} [{phase}] {el}m in{dl} · {hbs}")
+        lines.append(f"   {r['key']} · {r['lane']} lane"
+                     + (f" — [{step['state']}] {step['title']}" if step else ""))
+    if not runs:
+        gov, ready, _, _ = gov_now(ctx, conn)
+        lines.append("none — " + idle_reason(conn, gov, ready))
+    done = conn.execute(
+        "SELECT * FROM runs WHERE status NOT IN ('PREPARED','DISPATCHED') "
+        "AND role!='probe' ORDER BY id DESC LIMIT 5").fetchall()
+    if done:
+        lines.append("recent:")
+        for r in done[::-1]:
+            who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+            lines.append(f"· {common.local_str(r['ended_at'] or r['created_at'])} "
+                         f"{r['step_id']} {who} [{r['status']}] "
+                         f"{_run_outcome(conn, r)[:120]}")
+    return "\n".join(lines)[:3900]  # telegram hard limit 4096
+
+
+def why_text(ctx, conn, step_id=None) -> str:
+    """The failure story of a step: full last-block reason, then every run of
+    the relevant cycle with its outcome. Everything /status truncates lives
+    here untruncated (within Telegram's message budget)."""
+    step = db.get_step(conn, step_id) if step_id else None
+    if step_id and not step:
+        return f"engine-control: unknown step '{step_id}'"
+    if not step:  # default: most recently halted, else most recently updated
+        row = conn.execute(
+            "SELECT * FROM steps WHERE state IN ('BLOCKED','ABORTED') "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone() or conn.execute(
+            "SELECT * FROM steps WHERE state NOT IN ('PENDING','ACCEPTED') "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if not row:
+            return "engine-control: nothing in flight and nothing halted"
+        step = row
+    d = db.step_detail(step)
+    cycle = d.get("cycle", 0)
+    lines = [f"why {step['id']} — [{step['state']}] cycle {cycle} — {step['title']}"]
+    for t in conn.execute(
+            "SELECT * FROM transitions WHERE step_id=? ORDER BY id DESC LIMIT 3",
+            (step["id"],)).fetchall()[::-1]:
+        reason = (t["reason"] or "").strip().replace("\n", " ¶ ")
+        lines.append(f"{common.local_str(t['ts'], '%H:%M')} {t['from_state']}"
+                     f"→{t['to_state']}: {reason[:400]}")
+    runs = conn.execute(
+        "SELECT * FROM runs WHERE step_id=? AND cycle=? AND role!='probe' "
+        "ORDER BY id", (step["id"], cycle)).fetchall()
+    if not runs and cycle > 0:  # fresh /retry cycle with nothing yet: show previous
+        cycle -= 1
+        lines.append(f"(cycle {cycle + 1} has no runs yet; showing cycle {cycle})")
+        runs = conn.execute(
+            "SELECT * FROM runs WHERE step_id=? AND cycle=? AND role!='probe' "
+            "ORDER BY id", (step["id"], cycle)).fetchall()
+    for r in runs:
+        who = r["role"] + (f"/{r['model']}" if r["model"] else "")
+        lines.append(f"· {common.local_str(r['created_at'], '%H:%M')} "
+                     f"{who} [{r['status']}] {_run_outcome(conn, r)}")
+    if runs:
+        lines.append(f"artifacts: {runs[-1]['artifact_dir']}")
+    return "\n".join(lines)[:3900]  # telegram hard limit 4096
 
 
 def rearm_step(ctx, conn, step) -> str:
@@ -1308,11 +1606,16 @@ def handle_commands(ctx, conn, tg, cmds):
         db.event(conn, ctx, "tg_command", cmd=name, arg=arg)
         if name == "/status":
             tg.send(status_text(ctx, conn))
+        elif name == "/workers":
+            tg.send(workers_text(ctx, conn))
         elif name == "/pause":
             db.kv_set(conn, "paused", "1")
+            db.kv_set(conn, "paused_why",
+                      f"/pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
             tg.send("engine-control: paused (running workers finish; no new dispatch)")
         elif name == "/resume":
             db.kv_set(conn, "paused", "0")
+            db.kv_set(conn, "paused_why", "")
             for step in live_steps(conn):
                 if step["state"] == "WAITING_USER":
                     db.transition(conn, ctx, step["id"],
@@ -1361,15 +1664,51 @@ def handle_commands(ctx, conn, tg, cmds):
                 tg.send(f"engine-control: pace {arg}")
             else:
                 tg.send("engine-control: /pace auto|economy|balanced|sprint")
+        elif name == "/why":
+            tg.send(why_text(ctx, conn, arg))
         elif name == "/log":
             rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15").fetchall()
             out = "\n".join(f"{common.local_str(r['ts'], '%H:%M:%S')} {r['kind']} "
-                            f"{r['step_id'] or ''} {(r['payload'] or '')[:80]}"
+                            f"{r['step_id'] or ''} {(r['payload'] or '')[:160]}"
                             for r in rows[::-1])
             tg.send(out or "no events")
+        elif name == "/prs":
+            repos = sorted({r["k"].split(":", 1)[1] for r in conn.execute(
+                "SELECT k FROM kv WHERE k LIKE 'pr_tip:%' OR k LIKE 'pr_url:%'")})
+            out = []
+            for r in repos:
+                url = db.kv_get(conn, f"pr_url:{r}")
+                tip = db.kv_get(conn, f"pr_tip:{r}") or ""
+                lag = "" if tip == db.kv_get(conn, f"pr_pushed:{r}") else " · push pending"
+                out.append(f"{r}: {url or 'no PR yet'} (validated {tip[:10]}{lag})")
+            if out:
+                tg.send("engine-control PRs:\n" + "\n".join(out))
+            else:
+                tg.send("engine-control: no validated automation work has "
+                        "reached GitHub yet (PRs open on the first validated task)")
 
 
 # ---------- tick ----------
+
+def should_consume_tg(ctx) -> bool:
+    """While the low-latency listener is alive (fresh heartbeat) the tick
+    leaves getUpdates to it — two concurrent pollers 409 each other. A tick
+    woken BY the listener (EC_CONSUME_TG=1) always consumes; a stale
+    heartbeat (listener dead/hung) restores 1-minute fallback consumption."""
+    if os.environ.get("EC_CONSUME_TG") == "1":
+        return True
+    hb = ctx.root / "listener.alive"
+    try:
+        age = (datetime_now_ts() - hb.stat().st_mtime)
+    except OSError:
+        return True
+    return age > 90
+
+
+def datetime_now_ts() -> float:
+    import time as _t
+    return _t.time()
+
 
 def tick(ctx) -> int:
     lock = common.acquire_lock(ctx.root)
@@ -1396,8 +1735,9 @@ def tick(ctx) -> int:
         else:
             db.kv_set(conn, "warned_no_tg", "0")
             try:
-                cmds = tgm.consume(ctx, conn, tg)
-                handle_commands(ctx, conn, tg, cmds)
+                if should_consume_tg(ctx):
+                    cmds = tgm.consume(ctx, conn, tg)
+                    handle_commands(ctx, conn, tg, cmds)
             except Exception as e:
                 # a command-handler bug must never cost the tick its
                 # reconcile/advance work (commissioning review finding)
@@ -1409,6 +1749,10 @@ def tick(ctx) -> int:
             backup_state(ctx, conn)
             if db.kv_get(conn, "roadmap_started") == "1" and db.kv_get(conn, "paused") != "1":
                 advance_all(ctx, conn, roadmap)
+            if db.kv_get(conn, "roadmap_started") == "1":
+                # runs even when paused: already-validated work should stay
+                # visible on GitHub during an incident. Never raises.
+                ghpr.pr_sync(ctx, conn, roadmap)
             if db.kv_get(conn, "orch_err_streak", "0") != "0":
                 db.kv_set(conn, "orch_err_streak", "0")
         except Exception as e:
@@ -1419,7 +1763,9 @@ def tick(ctx) -> int:
                 episode = int(db.kv_get(conn, "orch_err_episode", "0")) + 1
                 db.kv_set(conn, "orch_err_episode", str(episode))
             episode = db.kv_get(conn, "orch_err_episode", "0")
-            ctx.log(f"orchestration error x{streak}: {e!r}")
+            import traceback
+            ctx.log(f"orchestration error x{streak}: {e!r}\n"
+                    + common.tail(traceback.format_exc(), 15))
             db.event(conn, ctx, "advance_error", err=repr(e)[:400], streak=streak)
             if streak in (1, 5):
                 tgm.notify(conn, ctx, f"orch-error:{episode}:{streak}",
@@ -1429,6 +1775,8 @@ def tick(ctx) -> int:
                 # DAG scheduler the safe containment is pausing dispatch
                 if db.kv_get(conn, "paused") != "1":
                     db.kv_set(conn, "paused", "1")
+                    db.kv_set(conn, "paused_why",
+                              f"auto-pause: persistent controller error x{streak}")
                     tgm.notify(conn, ctx, f"orch-pause:{episode}",
                                "engine-control: persistent controller error — dispatch "
                                "PAUSED (running workers finish). /resume after repair.")
@@ -1463,6 +1811,25 @@ def backup_state(ctx, conn):
 # ---------- CLI ----------
 
 TICK_TASK = "engine-control-tick"
+LISTENER_TASK = "engine-control-listener"
+
+
+def ensure_listener_task(ctx) -> None:
+    """Supervisor for the low-latency Telegram listener: fires every 5
+    minutes; the listener's byte lock makes redundant fires exit instantly,
+    so this is restart-on-crash, not duplication."""
+    import subprocess
+    cmd = f'"{sys.executable}" "{common.CODE_DIR / "tg_listener.py"}"'
+    q = subprocess.run(["schtasks", "/query", "/tn", LISTENER_TASK, "/fo", "csv", "/nh"],
+                       capture_output=True, text=True)
+    if q.returncode != 0:
+        subprocess.run(["schtasks", "/create", "/tn", LISTENER_TASK, "/sc", "minute",
+                        "/mo", "5", "/f", "/tr", cmd], capture_output=True, text=True)
+    elif "Disabled" in q.stdout:
+        subprocess.run(["schtasks", "/change", "/tn", LISTENER_TASK, "/enable"],
+                       capture_output=True, text=True)
+    subprocess.run(["schtasks", "/run", "/tn", LISTENER_TASK],
+                   capture_output=True, text=True)
 
 
 def cmd_start(ctx) -> int:
@@ -1491,6 +1858,7 @@ def cmd_start(ctx) -> int:
         subprocess.run(["schtasks", "/change", "/tn", TICK_TASK, "/enable"],
                        capture_output=True, text=True)
         print("tick task re-enabled")
+    ensure_listener_task(ctx)
     if db.kv_get(conn, "roadmap_started") == "1":
         print(f"roadmap already started (run {db.kv_get(conn, 'roadmap_run_id')}); "
               "no duplicate run created")
@@ -1500,6 +1868,7 @@ def cmd_start(ctx) -> int:
     run_id = f"run-{common.now()[:10]}-{_uuid.uuid4().hex[:8]}"
     db.kv_set(conn, "roadmap_run_id", run_id)
     db.kv_set(conn, "paused", "0")
+    db.kv_set(conn, "paused_why", "")
     db.kv_set(conn, "pace", db.kv_get(conn, "pace", "auto"))
     db.kv_set(conn, "roadmap_started", "1")
     db.event(conn, ctx, "roadmap_started", run_id=run_id, tier=view.get("tier"),
@@ -1533,6 +1902,8 @@ def cmd_install_task(ctx):
     p = subprocess.run(["schtasks", "/create", "/tn", TICK_TASK, "/sc", "minute",
                         "/mo", "1", "/f", "/tr", cmd], capture_output=True, text=True)
     print(p.stdout.strip() or p.stderr.strip())
+    ensure_listener_task(ctx)
+    print(f"listener task ensured ({LISTENER_TASK})")
     q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK], capture_output=True, text=True)
     print(q.stdout.strip()[:400])
     return p.returncode
@@ -1543,6 +1914,11 @@ def cmd_uninstall_task(ctx):
     p = subprocess.run(["schtasks", "/delete", "/tn", TICK_TASK, "/f"],
                        capture_output=True, text=True)
     print(p.stdout.strip() or p.stderr.strip())
+    subprocess.run(["schtasks", "/end", "/tn", LISTENER_TASK],
+                   capture_output=True, text=True)
+    q = subprocess.run(["schtasks", "/delete", "/tn", LISTENER_TASK, "/f"],
+                       capture_output=True, text=True)
+    print(q.stdout.strip() or q.stderr.strip())
     return p.returncode
 
 
@@ -1596,13 +1972,36 @@ def cmd_doctor(ctx):
     q = subprocess.run(["schtasks", "/query", "/tn", TICK_TASK], capture_output=True, text=True)
     print("[ok] tick task installed" if q.returncode == 0
           else "[..] tick task not installed (python control.py install-task)")
+    hb = ctx.root / "listener.alive"
+    try:
+        import time as _t
+        fresh = (_t.time() - hb.stat().st_mtime) < 90
+    except OSError:
+        fresh = False
+    print("[ok] telegram listener alive (commands answer in seconds)" if fresh
+          else "[..] telegram listener not running (commands at 1-minute tick "
+               "cadence; python control.py install-task starts it)")
+    exe = ghpr.gh_exe(ctx)
+    if exe:
+        a = subprocess.run([exe, "auth", "status"], capture_output=True, text=True)
+        if a.returncode == 0:
+            print(f"[ok] gh CLI authenticated ({exe})")
+        else:
+            print("[FAIL] gh CLI found but not authenticated — GitHub PR "
+                  "visibility will fail (gh auth login)"); bad = 1
+    else:
+        print("[..] gh CLI not found — GitHub PR visibility disabled "
+              "(install GitHub CLI + gh auth login, or set EC_GH_EXE)")
     try:
         roadmap = load_roadmap(ctx)
         print(f"[ok] roadmap: {len(roadmap['steps'])} steps, repos: {list(roadmap['repos'])}")
         for name, rc in roadmap["repos"].items():
             ws = Path(rc["workspace"])
             state = "ready" if (ws / ".git").exists() else "MISSING (python control.py init)"
-            print(f"     {name}: {ws} [{state}]")
+            slug = ghpr.github_slug(Path(rc["source"]))
+            pr = (f"PR → {slug} (base {rc.get('pr_base') or 'default'})" if slug
+                  else "no GitHub origin — PR visibility off")
+            print(f"     {name}: {ws} [{state}] · {pr}")
     except Exception as e:
         print(f"[FAIL] roadmap: {e}"); bad = 1
     return bad
@@ -1617,10 +2016,12 @@ def main(argv=None):
     except (AttributeError, OSError):
         pass
     ap = argparse.ArgumentParser(prog="control.py")
-    ap.add_argument("cmd", choices=["tick", "start", "status", "pause", "resume",
-                                    "retry", "abort", "log", "init", "doctor",
-                                    "install-task", "uninstall-task",
+    ap.add_argument("cmd", choices=["tick", "start", "status", "workers", "why",
+                                    "pause", "resume", "retry", "abort", "log", "init",
+                                    "doctor", "install-task", "uninstall-task",
                                     "telegram-detect-chat"])
+    ap.add_argument("target", nargs="?", default=None,
+                    help="step id for `why` (default: last halted step)")
     ap.add_argument("--root", default=None)
     args = ap.parse_args(argv)
     ctx = make_ctx(args.root)
@@ -1641,10 +2042,19 @@ def main(argv=None):
     conn = db.connect(ctx)
     if args.cmd == "status":
         print(status_text(ctx, conn))
+    elif args.cmd == "workers":
+        print(workers_text(ctx, conn))
+    elif args.cmd == "why":
+        print(why_text(ctx, conn, args.target))
     elif args.cmd == "pause":
-        db.kv_set(conn, "paused", "1"); print("paused")
+        db.kv_set(conn, "paused", "1")
+        db.kv_set(conn, "paused_why",
+                  f"CLI pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
+        print("paused")
     elif args.cmd == "resume":
-        db.kv_set(conn, "paused", "0"); print("resumed")
+        db.kv_set(conn, "paused", "0")
+        db.kv_set(conn, "paused_why", "")
+        print("resumed")
     elif args.cmd == "retry":
         class _T:  # reuse telegram handler without a bot
             def send(self, t): print(t)
@@ -1656,7 +2066,7 @@ def main(argv=None):
     elif args.cmd == "log":
         for r in conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 30").fetchall()[::-1]:
             print(f"{common.local_str(r['ts'], '%Y-%m-%d %H:%M:%S')} "
-                  f"{r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:100]}")
+                  f"{r['kind']:<18} {r['step_id'] or '':<10} {(r['payload'] or '')[:220]}")
     elif args.cmd == "telegram-detect-chat":
         tok = ctx.getenv("DEV_TELEGRAM_BOT_TOKEN")
         if not tok:

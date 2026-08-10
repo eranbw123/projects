@@ -10,8 +10,39 @@ utilization telemetry, envelopes, governor) · `db.py` (SQLite WAL; + steps
 depends_on/background/audit cols, telemetry, plan_detections) ·
 `claude_runner.py` (job contract, direct/task lanes, probe/adopt/kill, quota
 + fable guards, automation settings) · `telemetry_capture.py` (statusline →
-per-session JSON) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
-`validators.py`.
+per-session JSON) · `tg_listener.py` (long-poll command latency: wakes the
+tick with EC_CONSUME_TG=1; heartbeat `listener.alive` <90s makes the tick
+skip its own getUpdates — no 409s; stale heartbeat = automatic 1-min
+fallback; supervised by Scheduled Task `engine-control-listener` q5min +
+byte lock) · `worker_shim.py` · `gitops.py` · `telegram.py` ·
+`validators.py`. Probe pacing is signature-INDEPENDENT (kv probe_last_at +
+24/day cap): every -p session rewrites .claude.json, so sig-keyed pacing
+self-reset into a probe-per-tick loop (observed live, fixed). Contested-but-
+operational detection probes hourly; unresolved every 10m.
+
+## GitHub PR visibility (2026-08-10)
+`ghpr.py` tick phase: on_validating records the test-green integration tip
+(kv pr_tip); pr_sync pushes exactly that sha via `gitops.push_url` (explicit
+URL — clones keep DISABLED push remotes; guard unchanged) and keeps one open
+PR per repo (head automation/integration, base `pr_base:`/default; replaced
+after merge when new work lands). Failures notify once per tip + 10m backoff,
+never the error streak; runs while paused; idle cost 2 kv reads. gh CLI =
+auth/API (EC_GH_EXE). Telegram: push/PR-open notifications, `/prs`.
+
+## Worker visibility (2026-08-10)
+`/workers` (tg + CLI): every open run with probe phase, elapsed/deadline,
+lane, step title, and a real heartbeat — session transcript mtime under
+`~/.claude/projects/*/<session-uuid>.jsonl` (appended per message even
+headless; the statusline NEVER fires in -p mode, so telemetry/sessions is
+fallback only) + last tool name (metadata only, never transcript content).
+When idle it names the operative gate in tick order: not started / PAUSED
+(kv `paused_why`: set by /pause, CLI pause, auto-pause; empty = direct kv
+write, reported as maintenance) / quota hold / target 0 / no READY steps.
+/status: idle reason line when 0 active; run lines show elapsed + activity
+age; in-flight multi-task steps show `task i/n` (PRs open per validated
+task, so a step legitimately keeps running after its first PR — the
+progress marker + "step continues" in the task-done notification make that
+visible). tests/test_workers.py (9).
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied
@@ -50,10 +81,17 @@ family-level subscriptionType; any interactive session → profile+usage),
 stale telemetry degrades to the conservative unknown band, and CLI quota
 hits are the hard backstop. Tiers →
 envelopes: max20 4/5 (opus 2), max5+max_unknown 2/3, pro 1/2, unknown 1/1;
-fable cap 1 everywhere. Utilization: cachedUsageUtilization (primary) +
-automation statusline files (`telemetry/sessions/`, atomic, whitelist-only)
-→ telemetry table; stale >45m = decisions treat as unknown (normal, no
-burst). Pressure bands gate role classes (finish-first, §17); CLI quota hit
+fable cap 1 everywhere. Utilization: statusline files
+(`telemetry/sessions/`, atomic, whitelist-only, pruned >10d) +
+cachedUsageUtilization fallback → telemetry table; stale >45m = decisions
+treat as unknown. Statusline capture parses the REAL CLI ≥2.1 payload:
+top-level `rate_limits.{five_hour,seven_day}.used_percentage` + epoch
+`resets_at`→ISO (2026-08-10 fix: capture only knew speculative key names, so
+every statusline row was dropped and /status usage sat frozen on stale
+cli_cache — live check showed 6% cached vs 60% real). Headless -p workers
+render NO statusline, so the owner's user settings.json statusLine now runs
+telemetry_capture.py too (owner opted in; the AUTOMATION still never touches
+owner settings) — interactive sessions keep usage fresh. Pressure bands gate role classes (finish-first, §17); CLI quota hit
 → global quota_hold (reset-aware only when fresh usage corroborates ≥90%).
 Workers run `--setting-sources project --settings automation-settings.json`
 (owner user settings never loaded/modified — their ntfy hooks would fire on

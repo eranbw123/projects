@@ -244,8 +244,54 @@ class TestInfra(unittest.TestCase):
 
     def test_gitignore_covers_state(self):
         gi = (CODE / ".gitignore").read_text()
-        for needed in (".env", "state.db", "artifacts/", "logs/"):
+        for needed in (".env", "state.db", "artifacts/", "logs/",
+                       "listener.lock", "listener.alive"):
             self.assertIn(needed, gi)
+
+    def test_listener_cycle_and_tick_handoff(self):
+        """Low-latency listener: single instance, wakes the tick on updates,
+        heartbeats only on successful polls; the tick skips its own polling
+        while the heartbeat is fresh unless the listener woke it."""
+        import os
+        import time as _t
+        import control
+        import tg_listener as tl
+        ctx = self.sb.ctx()
+        # single instance via named lock
+        l1 = common.acquire_lock(ctx.root, "listener.lock")
+        self.assertIsNotNone(l1)
+        self.assertIsNone(common.acquire_lock(ctx.root, "listener.lock"))
+        common.release_lock(l1)
+        # idle poll: heartbeat written, no wake
+        calls = {"trigger": 0}
+        out = tl.cycle(ctx, fetch=lambda t, o, tm: [], trigger=lambda: 1 / 0)
+        self.assertEqual(out, "idle")
+        self.assertTrue((ctx.root / "listener.alive").exists())
+        # updates present: wake until consumed
+        pending = [[upd(1, 42, "/status")], []]
+        out = tl.cycle(ctx, fetch=lambda t, o, tm: pending.pop(0),
+                       trigger=lambda: calls.__setitem__("trigger", calls["trigger"] + 1),
+                       max_wakes=2, wake_pause=0)
+        self.assertEqual(out, "consumed")
+        self.assertEqual(calls["trigger"], 1)
+        # poll failure: NO heartbeat refresh (hung/broken listener goes stale)
+        (ctx.root / "listener.alive").write_text("old")
+        old_mtime = _t.time() - 300
+        os.utime(ctx.root / "listener.alive", (old_mtime, old_mtime))
+        def boom(t, o, tm):
+            raise OSError("net down")
+        self.assertEqual(tl.cycle(ctx, fetch=boom, trigger=lambda: None), "error")
+        self.assertLess(abs((ctx.root / "listener.alive").stat().st_mtime - old_mtime), 5)
+        # tick handoff: fresh heartbeat -> tick leaves polling to the listener
+        os.utime(ctx.root / "listener.alive", None)
+        self.assertFalse(control.should_consume_tg(ctx))
+        os.environ["EC_CONSUME_TG"] = "1"
+        try:
+            self.assertTrue(control.should_consume_tg(ctx))
+        finally:
+            del os.environ["EC_CONSUME_TG"]
+        os.utime(ctx.root / "listener.alive", (old_mtime, old_mtime))
+        self.assertTrue(control.should_consume_tg(ctx))
 
 
 if __name__ == "__main__":
