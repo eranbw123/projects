@@ -68,8 +68,10 @@ procedure: `tests/MANUAL_REBOOT_TEST.md`.
 - Worker `Bash(python:*)` could in principle write outside its worktree;
   git verbs are permission-scoped, the rest is gated by acceptance checks +
   independent review. Full sandboxing deferred.
-- Repair-after-cherry-conflict expects the repair worker to rebase onto
-  integration; canary verifies entry into REPAIRING only.
+- On cherry-pick conflict the repair worker re-applies the change as new
+  commits on the current integration content (its scoped tools cannot
+  rebase); /retry re-plans from the new tip if that fails. Canary verifies
+  entry into REPAIRING only.
 - step-10's independent fable audit uses the `audit` role prompt; controller
   wiring for it lands when step-10 is reached. WAITING_USER has no automatic
   entry (reserved for future /pause-at-step semantics). Deadline-kill path
