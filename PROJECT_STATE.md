@@ -116,7 +116,17 @@ passes `capacity.can_dispatch` (pressure class, target, fable=1/opus caps,
 local-test cap). Integration stays serialized per repo
 (`repo_integration_busy` defers enter_validation; deferral is idempotent —
 DONE runs are reprocessed next tick). Stale parallel work: base recorded per
-task; ancestry + cherry-pick conflict → REPAIR, never reset. A BLOCKED step
+task; a conflicted historical sha can never be rewritten from a worktree
+(add-only), so promotion falls back to a merge-tree squash of the net
+base..head change — object-DB merge, ONE commit carrying every source sha's
+-x provenance line (idempotency grep intact), landed ff-only. NOT `git apply
+--3way`: its --check exits 0 on conflicted merges (git 2.55, measured).
+Still-conflicting overlap → REPAIR with a byte-identical-convergence
+contract (contested regions = exact integration content, own work in
+untouched regions/files — adjacent insertions do NOT merge), never reset.
+This unwedged step-04 (2026-08-10: 4 hard-fails burned on repairs that
+could not fix a promotion-side conflict). Same day, owner dropped step-01's
+24h soak (roadmap now soak-free) and step-01 was accepted directly. A BLOCKED step
 blocks only its dependents; /retry [step] resumes in-place (cold replan only
 when the worktree is gone), /abort [step] prunes.
 Controller error streak ≥8 → auto-pause + notify (never blocks a healthy step).

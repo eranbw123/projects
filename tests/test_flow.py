@@ -345,6 +345,44 @@ class TestCherryConflict(FlowBase):
         self.assertEqual(tip, injected_tip, "no destructive recovery on integration")
 
 
+class TestSquashFallback(FlowBase):
+    """A conflicting historical commit must not wedge promotion forever
+    (step-04 field failure): after repair converges the net content
+    (contested file byte-identical to integration, own work in untouched
+    files), promotion squash-applies the net diff as one commit with full
+    provenance instead of replaying the stale sha."""
+    script = {"reviewer.1": "pass_slow", "repair": "converge"}
+
+    def test_flow(self):
+        self.assertTrue(self.sb.until_state("REVIEWING", 60), self.sb.transitions())
+        ws = self.sb.ws
+        (Path(ws) / "app.py").write_text("def add(a, b):\n    return b + a  # conflict\n")
+        git(["add", "-A"], ws)
+        git(["commit", "-m", "owner-side conflicting change"], ws)
+        self.assertTrue(self.sb.run_until(
+            lambda c: c.execute("SELECT COUNT(*) c FROM events WHERE kind='cherry_conflict'"
+                                ).fetchone()["c"] >= 1, 60), self.sb.transitions())
+        self.assertTrue(self.sb.until_state("ACCEPTED", 180), self.sb.transitions())
+        conn = self.sb.conn()
+        sq = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='squash_promoted'"
+                          ).fetchone()["c"]
+        self.assertGreaterEqual(sq, 1, "squash fallback did not engage")
+        rows = conn.execute("SELECT sha, integrated_sha FROM commits "
+                            "WHERE integrated_sha IS NOT NULL").fetchall()
+        self.assertGreaterEqual(len(rows), 2, "both worktree shas must be recorded")
+        squash_sha = rows[-1]["integrated_sha"]
+        msg = gitops.head_commit_message(Path(ws), squash_sha)
+        for r in rows:
+            if r["integrated_sha"] == squash_sha:
+                self.assertIn(f"cherry picked from commit {r['sha']}", msg)
+        conn.close()
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=ws,
+                            capture_output=True, text=True).stdout.strip()
+        self.assertEqual(st, "", "integration checkout must stay clean")
+        self.assertTrue((Path(ws) / "converged.py").exists(),
+                        "squashed work must reach the integration checkout")
+
+
 class TestMultiTask(FlowBase):
     """Cross-repo-shaped plans: ordered tasks, each with its own worktree and
     integration; step accepted only after every task validates."""

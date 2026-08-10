@@ -851,33 +851,85 @@ def enter_validation(ctx, conn, roadmap, step):
                      integrated, common.now()))
 
     shas = gitops.commits_between(ws, base, head)
-    for sha in shas:
+    last_ok = base
+    for i, sha in enumerate(shas):
         already = gitops.git_ro(
             ["log", INTEGRATION, f"--grep=cherry picked from commit {sha}",
              "--format=%H", "-1"], cwd=ws, check=False).stdout.strip()
         if already:
             record(sha, already)
+            last_ok = sha
             continue
         status, new_sha = cherry_pick_x(ws, sha)
         if status == "conflict":
             db.event(conn, ctx, "cherry_conflict", step_id=step["id"], sha=sha)
-            # the work was fine; integration moved underneath it — environment
-            # drift, not a failed attempt (the fuse still bounds repeats)
-            repair_or_block(ctx, conn, step,
-                            f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}: "
-                            "integration advanced under this task. Re-apply the change as new "
-                            "commits that apply cleanly on the current integration content; if "
-                            "that is impossible from this worktree, report status failed "
-                            "(the owner can /retry to re-plan from the new tip)",
-                            progressed=True)
-            return
+            # Integration moved under the task and worktrees may only ADD
+            # commits, so this historical sha can never stop conflicting —
+            # repair workers converge the NET content instead. Apply the
+            # remaining net diff as one squash commit before asking for repair.
+            remaining = shas[i:]
+            sq_status, sq_sha = squash_apply(ws, last_ok, head,
+                                             step["id"], remaining)
+            if sq_status == "conflict":
+                # environment drift with overlapping edits, not a failed
+                # attempt (the fuse still bounds repeats)
+                repair_or_block(ctx, conn, step,
+                                f"cherry-pick conflict integrating {sha[:10]} onto {INTEGRATION}, "
+                                "and the net task diff does not 3-way merge either: integration "
+                                "advanced under this task with overlapping edits. Converge your "
+                                "worktree so the merge resolves: for every region a file shares "
+                                f"with {INTEGRATION}, make your version BYTE-IDENTICAL to the "
+                                f"current integration content (git show {INTEGRATION}:<path> is "
+                                "read-only and allowed), and put this task's own changes in "
+                                "regions or files integration did not touch; then commit. If "
+                                "truly impossible, report status failed (the owner can /retry "
+                                "to re-plan from the new tip)",
+                                progressed=True)
+                return
+            if sq_status == "ok":
+                db.event(conn, ctx, "squash_promoted", step_id=step["id"],
+                         sha=sq_sha, n=len(remaining))
+                for r_sha in remaining:
+                    record(r_sha, sq_sha)
+            break  # "empty": remaining net change already present — proceed
         if status == "ok":
             record(sha, new_sha)
+        last_ok = sha
     dispatch(ctx, conn, step, "test", "", ws, "VALIDATING",
              "integration tests on promoted commits", test_cmds=rc["tests"])
     tgm.notify(conn, ctx, f"validate:{step['id']}:c{d.get('cycle',0)}t{d.get('task_idx',0)}",
                f"📦 {step_label(step)} promoted — {len(shas)} commit(s) → "
                f"{INTEGRATION} @ {gitops.current_sha(ws)[:10]}; validating")
+
+
+def squash_apply(ws, base, head, step_id, shas):
+    """Promotion fallback when a historical worktree commit no longer
+    cherry-picks: worktrees may only ADD commits, so a stale sha keeps
+    conflicting even after repair converges the content. Merge the net
+    base..head change in the object database (merge-tree touches no checkout;
+    a conflict leaves nothing to clean up) and land it as ONE ff-only commit
+    carrying every source sha's provenance line, so the idempotency grep and
+    the commits table keep working. NOT `git apply --3way`: on this git
+    (2.55) its --check exits 0 on a conflicted 3-way, which would commit
+    conflict markers."""
+    tip = gitops.current_sha(ws)
+    p = gitops.run_git(["merge-tree", "--write-tree", "--merge-base", base,
+                        tip, head], cwd=ws, check=False)
+    if p.returncode == 1:
+        return "conflict", None
+    if p.returncode != 0:
+        raise gitops.GitError(f"merge-tree rc={p.returncode}: "
+                              + (p.stderr or p.stdout).strip()[:300])
+    tree = p.stdout.splitlines()[0].strip()
+    if tree == gitops.git_ro(["rev-parse", f"{tip}^{{tree}}"], cwd=ws).stdout.strip():
+        return "empty", None
+    msg = (f"{step_id}: squash-apply {len(shas)} commit(s) — integration "
+           "advanced under the task\n\n"
+           + "\n".join(f"(cherry picked from commit {s})" for s in shas))
+    sha = gitops.run_git(["commit-tree", tree, "-p", tip, "-m", msg],
+                         cwd=ws).stdout.strip()
+    gitops.run_git(["merge", "--ff-only", sha], cwd=ws)
+    return "ok", sha
 
 
 def cherry_pick_x(repo, sha):
