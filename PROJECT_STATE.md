@@ -40,9 +40,11 @@ When idle it names the operative gate in tick order: not started / PAUSED
 write, reported as maintenance) / quota hold / target 0 / no READY steps.
 /status: idle reason line when 0 active; run lines show elapsed + activity
 age; in-flight multi-task steps show `task i/n` (PRs open per validated
-task, so a step legitimately keeps running after its first PR — the
-progress marker + "step continues" in the task-done notification make that
-visible). tests/test_workers.py (9).
+task, so a step legitimately keeps running after its first PR).
+`step_label()` puts the same 1-based `(task i/n)` on every task-scoped
+notification (review verdict, repair, tests, validation, quota, blocked,
+task-done "step continues") and on /workers run lines; single-task plans
+stay a bare step id. tests/test_workers.py (9).
 
 ## Scheduler (commissioned 2026-08-10)
 Roadmap is a dependency DAG (`depends_on`, `:validated` qualifier satisfied
