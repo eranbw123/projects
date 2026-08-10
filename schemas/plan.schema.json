@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": ["version", "step_id", "tasks", "acceptance"],
+  "properties": {
+    "version": {"type": "integer"},
+    "step_id": {"type": "string"},
+    "tasks": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["repo", "objective"],
+        "properties": {
+          "repo": {"type": "string"},
+          "objective": {"type": "string"},
+          "expected_files": {"type": "array", "items": {"type": "string"}},
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "rollback_conditions": {"type": "array", "items": {"type": "string"}},
+    "risks": {"type": "array", "items": {"type": "string"}}
+  }
+}

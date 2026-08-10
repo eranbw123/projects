@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "required": ["version", "step_id", "accepted_commits", "behavior", "decisions",
+               "interfaces", "metrics", "hypotheses_supported",
+               "hypotheses_falsified", "failures", "uncertainty",
+               "verification", "implications"],
+  "properties": {
+    "version": {"type": "integer"},
+    "step_id": {"type": "string"},
+    "accepted_commits": {"type": "array", "items": {
+      "type": "object", "required": ["repo", "sha"],
+      "properties": {"repo": {"type": "string"}, "sha": {"type": "string"},
+                     "original": {"type": "string"}}}},
+    "behavior": {"type": "string"},
+    "decisions": {"type": "array", "items": {"type": "string"}},
+    "interfaces": {"type": "array", "items": {"type": "string"}},
+    "metrics": {"type": "object"},
+    "hypotheses_supported": {"type": "array"},
+    "hypotheses_falsified": {"type": "array"},
+    "failures": {"type": "array"},
+    "uncertainty": {"type": "string"},
+    "verification": {"type": "string"},
+    "implications": {"type": "string"}
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": ["version", "status", "summary", "tests_run"],
+  "properties": {
+    "version": {"type": "integer"},
+    "status": {"type": "string", "enum": ["done", "failed"]},
+    "summary": {"type": "string"},
+    "decisions": {"type": "array", "items": {"type": "string"}},
+    "interfaces": {"type": "array", "items": {"type": "string"}},
+    "tests_run": {"type": "array", "items": {"type": "string"}},
+    "uncertainty": {"type": "string"},
+    "hypotheses_supported": {"type": "array", "items": {"type": "string"}},
+    "hypotheses_falsified": {"type": "array", "items": {"type": "string"}},
+    "implications": {"type": "string"}
+  }
+}

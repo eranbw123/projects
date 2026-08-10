@@ -1,0 +1,185 @@
+# engine-control roadmap — seeded at Step 0 (2026-08-10).
+# Baselines are pinned SHAs chosen at preflight:
+#   internet: engine-lab tip — linear descendant of main -> add-discovery-engine
+#             -> youtube-video-level-fallback; contains the discovery engine,
+#             youtube fallback and the engine lab (all of which the roadmap needs).
+#   ai:       commit-pending-export-work tip — main + the ChatGPT export
+#             resilience work (main lacks it; the roadmap depends on it).
+version: 1
+
+defaults:
+  lane: task
+
+repos:
+  internet:
+    source: 'C:\github\internet'
+    workspace: 'C:\projects\automation-workspace\internet'
+    baseline: 8af6de995d7555bca78d562a8212118824d83bff
+    tests:
+      - python test_discovery.py
+      - python test_watch.py
+  ai:
+    source: 'C:\github\ai'
+    workspace: 'C:\projects\automation-workspace\ai'
+    baseline: 8c7e08d2f77d91cf3e75684065e247cabcb82897
+    tests:
+      - python -m unittest discover -p "test_*.py"
+
+steps:
+  - id: step-01
+    ordinal: 1
+    title: Internet as an appliance
+    repos: [internet]
+    soak_minutes: 1440
+    objective: |
+      Make production discovery continuously operational without dependence on
+      an SSH session: real scheduler, feedback listener, authenticated
+      Chrome/CDP dependency handling, Telegram sending, service recovery and
+      health visibility. Use Windows Scheduled Tasks (the machine's proven
+      convention), never SSH-session children. The product should become
+      something the owner forgets exists until it sends something useful.
+    acceptance: |
+      Realistic kill/recovery and dependency-failure tests (Chrome/CDP down,
+      Telegram down, machine-sleep gap), not merely task creation. Health
+      state must be observable via stats.py counters. 24h soak after
+      validation.
+
+  - id: step-02
+    ordinal: 2
+    title: ai -> internet personal state contract
+    repos: [ai, internet]
+    objective: |
+      Create a stable versioned derived-state contract from the ai repository
+      to internet. internet must never couple to raw conversations.db — it
+      consumes a versioned derived artifact with a documented schema. Keep
+      repo responsibilities clean: ai derives and publishes, internet consumes.
+      Cross-repo: ordered repo tasks (ai producer first, internet consumer
+      second), each in its own worktree, integration validated across both.
+    acceptance: |
+      Contract file versioned and schema-documented; internet reads only the
+      contract; both repos' canonical suites green; a contract-version bump
+      path exists and is tested.
+
+  - id: step-03
+    ordinal: 3
+    title: Knowledge state
+    repos: [ai]
+    experiment: true
+    objective: |
+      Create a useful representation of what the owner already knows/believes,
+      distinct from what interests them, so novelty can become genuinely
+      personalized. Prove value through replay/evaluation over existing
+      conversation history rather than assuming the representation is useful.
+      Record hypothesis, baseline, primary metric, stopping and falsification
+      conditions before evaluation.
+    acceptance: |
+      Pre-registered replay evaluation executed; result recorded honestly even
+      if negative; representation format documented in the step-02 contract
+      lineage. A properly measured negative result is a PASS.
+
+  - id: step-04
+    ordinal: 4
+    title: Weak behavioral labels
+    repos: [ai]
+    experiment: true
+    objective: |
+      Extract noisy-but-useful supervision from conversation behavior:
+      recurrence, sustained follow-up, depth, rapid abandonment, response
+      rejection. Keep provenance and uncertainty on every label. Weak signals
+      are never treated as ground truth downstream.
+    acceptance: |
+      Label extraction runs over the corpus with provenance + uncertainty
+      fields; distribution sanity checks recorded; no downstream consumer
+      treats weak labels as gold.
+
+  - id: step-05
+    ordinal: 5
+    title: Future-self experiment
+    repos: [ai, internet]
+    experiment: true
+    models: {planner: fable}
+    objective: |
+      Freeze personal/knowledge state at historical time T and evaluate how
+      well it predicts later interests/conversations. Pre-register baselines
+      and metrics BEFORE examining outcomes. A properly executed falsification
+      is a successful step. The result must explicitly change the assumptions
+      used by later steps (recorded in the handoff implications).
+    acceptance: |
+      Pre-registration artifact exists before any outcome is examined;
+      leakage/contamination protections documented; result + implication
+      recorded in handoff; later-step assumptions updated accordingly.
+
+  - id: step-06
+    ordinal: 6
+    title: High-information teaching UI
+    repos: [internet]
+    objective: |
+      Build the smallest useful interface for explicit teaching/labeling,
+      prioritizing uncertain/high-information cases rather than indiscriminate
+      rating. No large dashboard. Reuse the existing feedback flow where
+      possible.
+    acceptance: |
+      Uncertainty-ranked queue demonstrably surfaces high-information items;
+      labels flow into the existing feedback store; UI stays minimal (measured
+      in code size; no new framework).
+
+  - id: step-07
+    ordinal: 7
+    title: Dynamic interests
+    repos: [internet]
+    objective: |
+      Layered interest state: OWNER / INFERRED / EMERGING / EXPLORATORY.
+      Owner-written interests remain authoritative and are never silently
+      overwritten. Derived interests evolve with explicit provenance,
+      promotion and decay rules. If planning stalls twice, escalate planner to
+      fable (dynamic-interest architecture checkpoint).
+    acceptance: |
+      Owner interests provably immutable by automation; promotion/decay rules
+      unit-tested; provenance queryable for every derived interest.
+
+  - id: step-08
+    ordinal: 8
+    title: Close the product loop
+    repos: [ai, internet]
+    models: {planner: fable}
+    objective: |
+      Connect conversation-derived state -> internet discovery -> feedback and
+      discoveries -> future state. Guard against circular self-confirmation
+      and feedback leakage: derived state influencing discovery must not be
+      fed back as if it were fresh evidence. Provenance must make every
+      important derived state traceable end-to-end.
+    acceptance: |
+      Loop demonstrated on real data; a leakage test proves a synthetic
+      injected preference does not self-amplify; provenance chain queryable.
+
+  - id: step-09
+    ordinal: 9
+    title: Information-frontier connectors
+    repos: [internet]
+    experiment: true
+    objective: |
+      Do not hard-code a connector choice. Measure which currently-missing
+      source is expected to add the highest marginal unique information value;
+      run bounded connector experiments before production promotion.
+      Incorporate existing engine-lab evidence (X prompt-lab conclusions,
+      proposal ledger) as evidence, not immutable truth.
+    acceptance: |
+      Candidate connectors compared on pre-registered marginal-value metrics;
+      only the winner (if any) promoted, behind the standard collector
+      interface; losers recorded with evidence in the handoff.
+
+  - id: step-10
+    ordinal: 10
+    title: Exploration engine + final whole-system audit
+    repos: [internet]
+    models: {planner: fable}
+    objective: |
+      Separate exploitation of known interests from exploration of adjacent
+      unknown interests: distinct budgets, thresholds, metrics and failure
+      containment. After implementation, an independent fable audit covers
+      both the product architecture and the development-control architecture
+      (audit role, fresh context, read-only).
+    acceptance: |
+      Exploration budget provably capped and isolated from exploitation
+      quality metrics; final independent fable audit returns PASS with no
+      critical/major findings.
