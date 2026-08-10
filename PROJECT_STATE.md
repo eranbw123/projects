@@ -63,7 +63,8 @@ headless; the statusline NEVER fires in -p mode, so telemetry/sessions is
 fallback only) + last tool name (metadata only, never transcript content).
 When idle it names the operative gate in tick order: not started / PAUSED
 (kv `paused_why`: set by /pause, CLI pause, auto-pause; empty = direct kv
-write, reported as maintenance) / quota hold / target 0 / no READY steps.
+write, reported as maintenance) / quota hold / target 0 / pressure-held
+READY steps (names the resume time + /go) / no READY steps.
 /status: progress header (`RUNNING · a/n accepted`), per-step lines via
 `step_line()` — READY vs `waits dep+dep` for PENDING, `task i/n`,
 `round r` + `f/4 hard-failed` (grant-relative), `retry k` (cycle),
@@ -174,6 +175,18 @@ render NO statusline, so the owner's user settings.json statusLine now runs
 telemetry_capture.py too (owner opted in; the AUTOMATION still never touches
 owner settings) — interactive sessions keep usage fresh. Pressure bands gate role classes (finish-first, §17); CLI quota hit
 → global quota_hold (reset-aware only when fresh usage corroborates ≥90%).
+Reset-aware usage (2026-08-10, owner finding: step-05 idled invisibly for
+an hour, then 45 extra min past the known reset): `current_usage` voids a
+window whose recorded resets_at has passed (`rolled5/7` — the meter
+restarted), so pressure-held starts release on the FIRST tick after reset
+even with zero fresh telemetry. A pressure-held READY step notifies once
+per step per reset window (⏳ key `hold:<id>:<reset5>`, auto-resume time +
+/go hint); idle_reason names this gate (was "dispatch expected next tick").
+`/go [step]` (tg, whitelisted, in /help) sets kv `force_start:<id>`,
+consumed one-shot by the scheduler: `can_dispatch(forced=True)` skips
+pressure classes + target, NEVER fable/opus caps. `cap.usage_text` is the
+single usage renderer (status/start/doctor/quota notes; shows resets-at,
+rollover, staleness).
 Workers run `--setting-sources project --settings automation-settings.json`
 (owner user settings never loaded/modified — their ntfy hooks would fire on
 every worker otherwise) + billing/nesting env stripped.
@@ -190,9 +203,18 @@ installed internet-discovery-* tasks (never blocks the tick), config
 show/set. Mutations whitelisted: product .env runtime keys (digest_time/
 digest_max/intervals/max_scores, validated; cadence keys auto re-run
 `--install` because triggers are derived at install time) + interests.json
-`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload). Every
+`min_score` via `set bar <key> <v>` (0.50–0.99, `app init` reload) +
+`set provider claude|chatgpt|anthropic|openai` → DISCOVERY_PROVIDER. Aliases:
+`chatgpt`/`gpt` → **`chatgpt_browser`** (chatgpt.com over CDP, NO key — the
+whole point; the browser twin of claude_chat), `claude` → `claude_chat`,
+`openai` → `openai` (direct API, needs key — kept as an explicit escape
+hatch), `anthropic` → `anthropic`. Browser engines get a "needs a logged-in
+<site> tab in the CDP Chrome" note; API engines warn on the missing key
+(+`pip install openai`); either warns on a pinned DISCOVERY_MODEL. `config`
+leads with engine+model. Product side is internet PR #14 (`chatgpt-browser.py`
+provider: session token + sentinel PoW + SSE, no API key). Every
 mutated file backed up to product backups/ first; no git ops in the module;
-EC_NEWS_ROOT overrides the product root (tests). tests/test_news.py (14).
+EC_NEWS_ROOT overrides the product root (tests). tests/test_news.py (23).
 Product deployed same day: PR #9 merged, six tasks installed+verified,
 digest flowing (see owner-repo commit e4485dc for the two live-install
 fixes).
@@ -215,11 +237,13 @@ silently ignore.
   rule; detection stays contested + probing. Do not "fix" by hand.
 
 ## Tests
-tests/: test_infra 13 · test_flow 19 · test_capacity 38 (detector matrix,
-telemetry matrix, governor policy, shape-drift, finish-cap) · test_dag 15
+tests/: test_infra 13 · test_flow 19 · test_capacity 46 (detector matrix,
+telemetry matrix, governor policy, shape-drift, finish-cap, reset-rollover
+voiding, forced-dispatch caps) · test_dag 17
 (topology, parallel diamond, background lane incl. stale-telemetry,
 upgrade/downgrade, pressure, quota hold + sustained outage, fable cap, audit
-step, overlap conflict, concurrent recovery). All green 2026-08-10 after
+step, overlap conflict, concurrent recovery, hold-notify + /go, reset
+release). All green 2026-08-10 after
 independent Opus review REPAIR round. `scripts/smoke_real.py` = tiny
 real-Claude smoke (§45), PASS.
 

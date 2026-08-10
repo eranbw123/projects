@@ -531,9 +531,22 @@ def ingest_telemetry(ctx, conn) -> int:
     return n
 
 
+def _rolled(reset_iso) -> bool:
+    if not reset_iso or not isinstance(reset_iso, str):
+        return False
+    try:
+        return common.is_past(reset_iso)
+    except (ValueError, TypeError):
+        return False
+
+
 def current_usage(conn) -> dict | None:
     """Freshest utilization record; stale records are ignored for decisions
-    (returned with stale=True so status can still show them)."""
+    (returned with stale=True so status can still show them). A window whose
+    known reset time has PASSED no longer describes the present — the meter
+    restarted near zero at reset — so its percentage is voided (owner finding
+    2026-08-10: the engine sat out 45 extra minutes waiting for staleness
+    when the 5h reset moment was known all along)."""
     row = conn.execute(
         "SELECT * FROM telemetry ORDER BY fetched_at DESC LIMIT 1").fetchone()
     if not row:
@@ -541,7 +554,32 @@ def current_usage(conn) -> dict | None:
     u = dict(row)
     u["age_min"] = _age_min(row["fetched_at"])
     u["stale"] = u["age_min"] > USAGE_STALE_MIN
+    u["rolled5"] = _rolled(u.get("reset5"))
+    u["rolled7"] = _rolled(u.get("reset7"))
+    if u["rolled5"]:
+        u["pct5"] = None
+    if u["rolled7"]:
+        u["pct7"] = None
     return u
+
+
+def usage_text(usage) -> str:
+    """One consistent owner-facing usage line (status/doctor/notifications)."""
+    if not usage:
+        return "usage: no telemetry yet"
+
+    def pct(v):
+        return "?" if v is None else f"{v:g}%"
+
+    line = f"usage 5h {pct(usage.get('pct5'))} · 7d {pct(usage.get('pct7'))}"
+    if usage.get("rolled5"):
+        line += (" · 5h window reset "
+                 f"{common.local_when(usage['reset5'])} (fresh start)")
+    elif usage.get("reset5"):
+        line += f" · resets {common.local_when(usage['reset5'])}"
+    stale = " STALE" if usage.get("stale") else ""
+    return (f"{line} ({int(usage.get('age_min') or 0)}m ago{stale}, "
+            f"{usage.get('source')})")
 
 
 # ------------------------------------------------------------------ policy
@@ -635,26 +673,30 @@ def local_tests_active(conn) -> int:
         "AND role='test'").fetchone()["c"]
 
 
-def can_dispatch(ctx, conn, gov, role, model, new_step=False, background=False) -> bool:
-    """Single gate every dispatch decision goes through."""
+def can_dispatch(ctx, conn, gov, role, model, new_step=False, background=False,
+                 forced=False) -> bool:
+    """Single gate every dispatch decision goes through. `forced` is the
+    owner's /go override: it skips the pressure/target governor (the owner
+    outranks the budget policy) but never the per-model caps."""
     klass = ROLE_CLASS.get(role, "build")
     if klass == "free":
         return local_tests_active(conn) < int(ctx.getenv("EC_LOCAL_TEST_CAP", "2"))
     if klass == "probe":
         return True
-    if klass not in gov["allowed"]:
-        return False
-    if new_step and "start" not in gov["allowed"] and not background:
-        return False
-    if background and "background" not in gov["allowed"]:
-        return False
-    if gov["active"] >= gov["target"] and klass in ("build", "plan"):
-        return False
-    # finishing work is protected but not unbounded: under real pressure it
-    # may not balloon past the target either (commissioning review finding)
-    if klass == "finish" and gov["pressure"] in ("high", "very_high") \
-            and gov["active"] >= max(gov["target"], 2):
-        return False
+    if not forced:
+        if klass not in gov["allowed"]:
+            return False
+        if new_step and "start" not in gov["allowed"] and not background:
+            return False
+        if background and "background" not in gov["allowed"]:
+            return False
+        if gov["active"] >= gov["target"] and klass in ("build", "plan"):
+            return False
+        # finishing work is protected but not unbounded: under real pressure
+        # it may not balloon past the target (commissioning review finding)
+        if klass == "finish" and gov["pressure"] in ("high", "very_high") \
+                and gov["active"] >= max(gov["target"], 2):
+            return False
     if model == "fable" and model_active(conn, "fable") >= gov["env"]["fable"]:
         return False
     if model == "opus" and model_active(conn, "opus") >= gov["env"]["opus"]:

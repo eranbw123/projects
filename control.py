@@ -194,7 +194,8 @@ def integration_sha(roadmap, repo_name) -> str:
 
 # ---------- dispatch ----------
 
-def gate(ctx, conn, role, model, new_step=False, background=False) -> bool:
+def gate(ctx, conn, role, model, new_step=False, background=False,
+         forced=False) -> bool:
     """Per-tick dispatch gate (capacity governor). CLI paths without a
     governor context are not gated."""
     gov = getattr(ctx, "gov", None)
@@ -202,8 +203,8 @@ def gate(ctx, conn, role, model, new_step=False, background=False) -> bool:
         return True
     if gov["budget"] <= 0:
         return False
-    return cap.can_dispatch(ctx, conn, gov, role, model,
-                            new_step=new_step, background=background)
+    return cap.can_dispatch(ctx, conn, gov, role, model, new_step=new_step,
+                            background=background, forced=forced)
 
 
 def dispatch(ctx, conn, step, role, prompt, cwd, to_state, reason,
@@ -410,7 +411,7 @@ def wait_quota(ctx, conn, step):
         conn.execute("UPDATE steps SET retry_at=? WHERE id=?", (retry_at, step["id"]))
     db.transition(conn, ctx, step["id"], "WAITING_QUOTA", "model quota/limit hit")
     if streak == 1 or streak % 8 == 0:
-        u = (f"usage 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}% · "
+        u = (cap.usage_text(usage) + " · "
              if usage and not usage.get("stale") else "")
         tgm.notify(conn, ctx, f"quota:{step['id']}:{streak}",
                    f"⌛ {step_label(step)} waiting on model quota (hit {streak})\n"
@@ -631,10 +632,11 @@ def worker_rules(ctx, step) -> str:
 
 # ---- stage starters ----
 
-def start_planning(ctx, conn, roadmap, step, new_step=False):
+def start_planning(ctx, conn, roadmap, step, new_step=False, forced=False):
     scfg = step_cfg(roadmap, step["id"])
     if not gate(ctx, conn, "planner", route_model(scfg, "planner")[0],
-                new_step=new_step, background=bool(step["background"])):
+                new_step=new_step, background=bool(step["background"]),
+                forced=forced):
         return
     repos = json.loads(step["repos"])
     blocks = []
@@ -1038,10 +1040,10 @@ def build_handoff(ctx, conn, roadmap, step) -> dict:
 
 # ---- final independent audit steps (audit: true in roadmap) ----
 
-def start_audit(ctx, conn, roadmap, step, new_step=False):
+def start_audit(ctx, conn, roadmap, step, new_step=False, forced=False):
     scfg = step_cfg(roadmap, step["id"])
     model, effort = route_model(scfg, "audit")
-    if not gate(ctx, conn, "audit", model, new_step=new_step):
+    if not gate(ctx, conn, "audit", model, new_step=new_step, forced=forced):
         return
     primary = json.loads(step["repos"])[0]
     ws = Path(repo_cfg(roadmap, primary)["workspace"])
@@ -1212,17 +1214,33 @@ def advance_all(ctx, conn, roadmap):
     for s in ready:
         if gov["budget"] <= 0:
             break
+        forced = db.kv_get(conn, f"force_start:{s['id']}") == "1"
         if s["background"]:
             bg_active = conn.execute(
                 "SELECT COUNT(*) c FROM steps WHERE background=1 AND state NOT IN "
                 "('PENDING','ACCEPTED','ABORTED','BLOCKED')").fetchone()["c"]
             if bg_active >= gov["env"]["background"]:
                 continue
+        elif not forced and "start" not in gov["allowed"]:
+            # mirrors capacity.can_dispatch's new-step gate. A held READY step
+            # must never be silent (owner finding 2026-08-10: step-05 sat
+            # invisible for an hour): say it once per step per reset window,
+            # with the automatic resume time and the manual lever.
+            u = gov.get("usage") or {}
+            tgm.notify(conn, ctx,
+                       f"hold:{s['id']}:{u.get('reset5') or common.now()[:13]}",
+                       f"⏳ {s['id']} ready — held by usage pressure "
+                       f"({gov['pressure']}); {cap.usage_text(u)}\n"
+                       f"starts automatically {_hold_hint(u)} · /go {s['id']} "
+                       "starts it now (finishing work is unaffected)")
+            continue
         step = db.get_step(conn, s["id"])
         if step["audit"]:
-            start_audit(ctx, conn, roadmap, step, new_step=True)
+            start_audit(ctx, conn, roadmap, step, new_step=True, forced=forced)
         else:
-            start_planning(ctx, conn, roadmap, step, new_step=True)
+            start_planning(ctx, conn, roadmap, step, new_step=True, forced=forced)
+        if forced and db.get_step(conn, s["id"])["state"] != "PENDING":
+            db.kv_set(conn, f"force_start:{s['id']}", "")  # one-shot, consumed
 
 
 STEP_ERR_BLOCK_AT = 8   # ticks of repeated per-step controller error -> BLOCKED
@@ -1703,12 +1721,7 @@ def status_text(ctx, conn) -> str:
     mode = "auto" if not gov["override"] else f"override:{gov['override']}"
     lines.append(f"plan {TIER_LABEL.get(gov['tier'], gov['tier'])} "
                  f"({mode}, {view.get('confidence', '?')}) · auth {view.get('auth_mode', '?')}")
-    if usage:
-        stale = " STALE" if usage.get("stale") else ""
-        lines.append(f"usage 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
-                     f" ({int(usage.get('age_min', 0))}m ago{stale}, {usage.get('source')})")
-    else:
-        lines.append("usage: no telemetry yet")
+    lines.append(cap.usage_text(usage))
     lines.append(f"workers {gov['active']} active / target {gov['target']}"
                  f" · pressure {gov['pressure']} · pace {gov['pace']} (/workers)")
     if gov["active"] == 0 and started:
@@ -1835,6 +1848,14 @@ def gov_now(ctx, conn):
     return gov, ready, view, usage
 
 
+def _hold_hint(usage) -> str:
+    """When a pressure-held start will resume on its own."""
+    u = usage or {}
+    if u.get("reset5"):
+        return f"after the 5h window resets ({common.local_when(u['reset5'])})"
+    return "when usage falls or telemetry ages out (~45m)"
+
+
 def idle_reason(conn, gov, ready) -> str:
     """Why zero workers are running — checked in the order the tick gates
     dispatch, so the first true condition is the operative one."""
@@ -1849,6 +1870,13 @@ def idle_reason(conn, gov, ready) -> str:
         return f"quota hold until {common.local_when(hold)}"
     if gov["target"] == 0:
         return f"dispatch target 0 (pressure {gov['pressure']})"
+    if ready and "start" not in gov["allowed"]:
+        # the gate that actually held step-05 on 2026-08-10 while /status
+        # promised "dispatch expected next tick" — name it, with the exit
+        u = gov.get("usage") or {}
+        return (f"{len(ready)} READY step(s) held by usage pressure "
+                f"({gov['pressure']}) — starts resume {_hold_hint(u)}, "
+                f"or /go {ready[0]} now; finishing work is unaffected")
     if not ready:
         return "no READY steps (waiting on dependencies, soak, or retry timers)"
     return "dispatch expected next tick"
@@ -1997,6 +2025,8 @@ def help_text() -> str:
         "replans from scratch only when the worktree is gone)\n"
         "/abort [step] — stop a step for good (dependents halt)\n"
         "/pause · /resume — dispatch gate (running workers finish)\n"
+        "/go [step] — force-start a READY step through the usage-pressure "
+        "hold (per-model caps still apply)\n"
         "/prs — GitHub PRs for validated work\n"
         "/log — recent engine events\n"
         f"/profile auto|{'|'.join(sorted(cap.ENVELOPES))} — plan override (debug)\n"
@@ -2100,6 +2130,23 @@ def handle_commands(ctx, conn, tg, cmds):
                 tg.send(f"pace {arg}")
             else:
                 tg.send("/pace auto|economy|balanced|sprint")
+        elif name == "/go":
+            targets = [s for s in live_steps(conn) if step_ready(conn, s)
+                       and (arg is None or s["id"] == arg)]
+            if not targets:
+                tg.send(f"nothing READY to force-start{f' ({arg})' if arg else ''}"
+                        " — deps unmet, already running, or done. /status")
+            elif arg is None and len(targets) > 1:
+                tg.send("several READY steps — /go <step-id>: "
+                        + ", ".join(s["id"] for s in targets))
+            else:
+                for s in targets:
+                    db.kv_set(conn, f"force_start:{s['id']}", "1")
+                note = (" (engine is PAUSED — /resume first)"
+                        if db.kv_get(conn, "paused") == "1" else "")
+                tg.send("🚀 " + ", ".join(s["id"] for s in targets)
+                        + " will start next tick, bypassing the usage-pressure"
+                          " hold (per-model caps still apply)" + note)
         elif name == "/why":
             tg.send(why_text(ctx, conn, arg))
         elif name == "/help" or name == "/start":
@@ -2323,8 +2370,7 @@ def cmd_start(ctx) -> int:
     gov = cap.governor(ctx, conn, view, usage,
                        len([s for s in ready if not s["background"]]))
     label = TIER_LABEL.get(gov["tier"], gov["tier"])
-    ulines = (f"Usage: 5h {usage.get('pct5', '?')}% · 7d {usage.get('pct7', '?')}%"
-              if usage else "Usage: telemetry pending")
+    ulines = cap.usage_text(usage)
     branches = "\n".join(f"• {s['id']} — {s['title']}" for s in ready[:4])
     tgm.notify(conn, ctx, f"roadmap:started:{run_id}",
                "🚀 AUTONOMOUS ROADMAP STARTED\n"
@@ -2404,8 +2450,7 @@ def cmd_doctor(ctx):
               + (f" overrides={view.get('billing_overrides')}"
                  if view.get("billing_overrides") else ""))
         if usage:
-            print(f"[ok] usage telemetry: 5h {usage.get('pct5')}% · "
-                  f"7d {usage.get('pct7')}% (age {int(usage.get('age_min', 0))}m)")
+            print(f"[ok] {cap.usage_text(usage)}")
         else:
             print("[..] usage telemetry: none yet (populates after first session)")
         conn0.close()

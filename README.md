@@ -111,10 +111,14 @@ validated `automation/integration` tip and — in a dedicated tick phase
 (`ghpr.pr_sync`) — pushes exactly that commit to GitHub and keeps ONE open
 pull request per repo (head `automation/integration`, base `pr_base:` from
 `roadmap.yaml`, falling back to the repo's default branch if that branch
-disappears). The PR body is regenerated from `state.db` each push: baseline,
-last validated push, and a per-step table (state, commit count, last
-integration). Telegram announces PR opening and every push, with links;
-`/prs` lists current PRs on demand.
+disappears). The PR body is regenerated from `state.db` each push and is
+deliberately detailed: baseline and last validated push, a **"README updates
+from this branch"** section carrying the docs worker's changelog verbatim
+(what the repo's main README gains because of this branch — see the next
+section), a per-step table (state, commit count, last integration), and an
+**"Every change in this branch"** commit-by-commit list (subjects from
+baseline to tip, capped at 100). Telegram announces PR opening and every
+push, with links; `/prs` lists current PRs on demand.
 
 Semantics worth knowing:
 
@@ -150,13 +154,18 @@ a one-line repo description. The controller then:
   validations) and advances `pr_tip`, so the normal PR push carries it. The
   pushed tip stays test-green by construction: byte-identical code to an
   already-validated tip, README-only delta;
+- keeps the worker's detailed changelog of the README update and publishes
+  it verbatim in the PR body ("README updates from this branch");
 - PATCHes the repo description via `gh api` when it changes.
 
 Cost/safety: one docs worker in flight globally, background capacity class
-(never steals a roadmap slot), 6h per-repo cooldown (a missing README skips
-the cooldown), no dispatch while paused. A rejected commit is discarded and
-that tip is never retried — the next validated tip triggers a fresh attempt.
-Worker or GitHub failures notify once, back off, and never pause development.
+(never steals a roadmap slot), no dispatch while paused. There is NO
+cooldown — every newly published validated tip triggers a refresh, so the
+repo's README always reflects the branch; the refresh's own integration
+commit is marked covered, so publishing it never re-triggers a refresh of
+itself. A rejected commit is discarded and that tip is never retried — the
+next validated tip triggers a fresh attempt. Worker or GitHub failures
+notify once, back off, and never pause development.
 
 ## Recovery
 
@@ -257,6 +266,7 @@ python test_infra.py           # unit: lock, git guard, telegram, redaction...
 python -m unittest test_flow   # canary scenarios (acceptance matrix)
 python -m unittest test_capacity  # plan-detector + telemetry + governor matrix
 python -m unittest test_dag    # DAG, capacity transitions, concurrent recovery
+python -m unittest test_pr test_docs test_news test_workers test_visibility
 python ..\scripts\smoke_real.py   # tiny REAL-Claude smoke (2 haiku calls)
 ```
 
@@ -264,3 +274,8 @@ Canary tests stub only the model (`tests/stub_worker.py`); dispatch,
 supervision, git promotion and validation paths are real. Test roots use
 `harness.mkroot()` — never `tempfile.mkdtemp`, whose restricted Windows DACL
 is unreadable from the Task Scheduler session.
+
+GitHub Actions (`.github/workflows/tests.yml`) runs the full offline suite
+on `windows-latest` for every PR and push to `main` — the controller is
+Windows-only (Scheduled Tasks, `taskkill`, `cmd /d /c`), so CI runs where
+the code actually lives.

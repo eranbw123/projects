@@ -88,6 +88,17 @@ class TestValidators(unittest.TestCase):
             with self.assertRaises(newsops.NewsError):
                 check(bad)
 
+    def test_provider(self):
+        # chatgpt means the browser session (no key); openai is the API path.
+        for alias, canon in (("claude", "claude_chat"), ("claude_chat", "claude_chat"),
+                             ("chatgpt", "chatgpt_browser"), ("ChatGPT", "chatgpt_browser"),
+                             ("gpt", "chatgpt_browser"), ("chatgpt_browser", "chatgpt_browser"),
+                             ("openai", "openai"), ("anthropic", "anthropic")):
+            self.assertEqual(newsops._provider(alias), canon)
+        for bad in ("gemini", "", "webscrape"):
+            with self.assertRaises(newsops.NewsError):
+                newsops._provider(bad)
+
 
 class TestConfigSet(NewsBase):
     def test_runtime_key_writes_env_and_backs_up(self):
@@ -107,9 +118,47 @@ class TestConfigSet(NewsBase):
                         f"cadence change must re-register triggers: {self.calls}")
 
     def test_unknown_key_rejected(self):
-        out = newsops.command(self.ctx, "set", ["provider", "openai"])
+        out = newsops.command(self.ctx, "set", ["volume", "11"])
         self.assertIn("unknown setting", out)
-        self.assertNotIn("provider", self.env_text())
+        self.assertNotIn("volume", self.env_text())
+
+    def test_set_provider_chatgpt_is_the_browser_engine_no_key_needed(self):
+        out = newsops.config_set(self.ctx, "provider", "chatgpt")
+        self.assertIn("claude_chat → chatgpt_browser", out)
+        self.assertIn("chatgpt.com session", out)
+        self.assertIn("logged-in chatgpt.com tab", out, "browser requirement surfaced")
+        self.assertNotIn("OPENAI_API_KEY", out, "browser engine must not demand a key")
+        self.assertNotIn("⚠", out, "no key warning for the browser engine")
+        self.assertIn("DISCOVERY_PROVIDER=chatgpt_browser", self.env_text())
+        self.assertTrue(any(n.startswith(".env-") for n in self.backups()))
+        self.assertEqual(self.calls, [], "engine switch must not re-install tasks")
+
+    def test_set_provider_openai_is_the_api_path_and_warns_on_missing_key(self):
+        out = newsops.config_set(self.ctx, "provider", "openai")
+        self.assertIn("claude_chat → openai", out)
+        self.assertIn("OPENAI_API_KEY", out, "API path missing key must be surfaced")
+        self.assertIn("pip install openai", out)
+        self.assertIn("DISCOVERY_PROVIDER=openai", self.env_text())
+
+    def test_set_provider_back_to_claude_has_no_warning(self):
+        newsops.config_set(self.ctx, "provider", "chatgpt")
+        out = newsops.config_set(self.ctx, "provider", "claude")
+        self.assertIn("chatgpt_browser → claude_chat", out)
+        self.assertIn("claude.ai session", out)
+        self.assertNotIn("⚠", out)
+        self.assertIn("DISCOVERY_PROVIDER=claude_chat", self.env_text())
+
+    def test_set_provider_warns_when_a_pinned_model_overrides_the_default(self):
+        (self.product / ".env").write_text(
+            "DISCOVERY_MODEL=gpt-9-custom\nANTHROPIC_API_KEY=sk-x\n", encoding="utf-8")
+        out = newsops.config_set(self.ctx, "provider", "chatgpt")
+        self.assertIn("DISCOVERY_MODEL is pinned", out)
+
+    def test_set_provider_rejects_unknown_engine(self):
+        out = newsops.command(self.ctx, "set", ["provider", "gemini"])
+        self.assertIn("news:", out)
+        self.assertIn("chatgpt", out, "error names the valid engines")
+        self.assertNotIn("DISCOVERY_PROVIDER", self.env_text())
 
     def test_bar_rewrites_interests_and_reloads(self):
         out = newsops.config_set(self.ctx, "bar", "alpha", "0.7")
@@ -150,6 +199,13 @@ class TestRunAndRouting(NewsBase):
         self.assertIn("alpha 0.74", out)
         self.assertIn("beta 0.78", out, "default bar shown for bar-less interest")
         self.assertIn("stocks 1h", out)
+
+    def test_config_text_shows_the_engine(self):
+        self.assertIn("engine: claude_chat", newsops.config_text(self.ctx))
+        newsops.config_set(self.ctx, "provider", "chatgpt")
+        out = newsops.config_text(self.ctx)
+        self.assertIn("engine: chatgpt_browser", out)
+        self.assertIn("auto", out)
 
     def test_command_never_raises(self):
         def boom(ctx):
