@@ -14,8 +14,8 @@ repos:
   internet:
     source: 'C:\github\internet'
     workspace: 'C:\projects\automation-workspace\internet'
-    baseline: 8af6de995d7555bca78d562a8212118824d83bff
-    pr_base: engine-lab          # baseline == this branch's tip: PR shows only automation work
+    baseline: 1cdfa0989ee5de37e2d816d60f2adc3f4eec8dfc
+    pr_base: main                # deploy branch the appliance auto-updates from (self_update); validated automation must PR here, not a branch nothing deploys. baseline == this branch's tip: PR shows only automation work
     tests:
       - python test_discovery.py
       - python test_watch.py
