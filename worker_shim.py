@@ -17,13 +17,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# This shim runs windowless (detached, or under a hidden-console task), so a
+# console child would otherwise allocate a brand-new VISIBLE console window
+# on the owner's desktop — one flash per spawn. CREATE_NO_WINDOW gives the
+# child a hidden console that the whole worker tree then inherits.
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def pid_alive(pid: int) -> bool:
     p = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, creationflags=NOWIN)
     out = (p.stdout or "").strip()
     if not out.startswith('"'):
         return False
@@ -69,7 +76,8 @@ def main():
         with open(art / "stdout.txt", "wb") as out, open(art / "stderr.txt", "wb") as err:
             p = subprocess.run(job["argv"], cwd=job.get("cwd") or None, env=env,
                                stdin=stdin, stdout=out, stderr=err,
-                               timeout=job.get("timeout") or 7200)
+                               timeout=job.get("timeout") or 7200,
+                               creationflags=NOWIN)
             rc = p.returncode
     except subprocess.TimeoutExpired:
         rc = 124

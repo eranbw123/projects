@@ -253,7 +253,18 @@ def spawn(ctx: common.Ctx, key: str, lane: str) -> dict:
         # /st is a far-future fallback; we /run immediately. Shim idempotence
         # neutralizes a later trigger fire. en-US time format (machine-local tool).
         st = (datetime.now() + timedelta(hours=12))
-        cmd = f'"{PYTHON}" "{shim}" "{rd}"'
+        # wscript + hidden.vbs: a bare python.exe action flashes a console
+        # window in the interactive session on every worker spawn; the
+        # GUI-subsystem host runs it with a hidden window and still
+        # propagates the shim's exit code. The full python+shim+rd command
+        # goes in a launch.cmd inside rd (not into /tr, where the wrapper
+        # prefix would eat most of the ~240-char budget); /d guards against
+        # this machine's cmd AutoRun hook.
+        vbs = str(common.CODE_DIR / "hidden.vbs")
+        launcher = rd / "launch.cmd"
+        launcher.write_text(f'@echo off\r\n"{PYTHON}" "{shim}" "{rd}"\r\n',
+                            encoding="utf-8")
+        cmd = f'wscript //B "{vbs}" cmd /d /c "{launcher}"'
         # schtasks hard-fails /tr >260 chars and SILENTLY never runs commands
         # just under that (measured: 240 ok, 260 created-but-never-ran).
         if len(cmd) > 235:

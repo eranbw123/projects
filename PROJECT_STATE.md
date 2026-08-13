@@ -1,7 +1,28 @@
 # PROJECT_STATE.md — `engine-control`
 
-Updated 2026-08-10 (commissioning: DAG scheduler + auto plan detection +
-live telemetry). Imported by CLAUDE.md. Current state only.
+Updated 2026-08-13 (all-stop pause now covers the news appliance). Imported
+by CLAUDE.md. Current state only.
+
+## all-stop /pause (2026-08-13)
+`/pause` · `/resume` (and `control.py pause/resume` CLI) are now the owner's
+one token switch: besides the existing dispatch gate (kv `paused`, tick
+skips `advance_all`), they call `newsops.pause/resume` → `python -m app
+pause/resume` in the product repo, flipping the appliance's own
+`service_state.paused` flag — run-once/web-tick/digest exit immediately
+(0 LLM spend), product `health` reports PAUSED instead of degraded — AND
+best-effort `schtasks /change /disable|/enable` over `newsops.TASKS`
+(`_toggle_tasks`), so nothing even fires while paused. The flag is the
+guarantee, the task toggle just silences the no-op fires: tasks registered
+from an elevated shell deny /change to the unelevated tick/listener
+(observed live 2026-08-13 until a re-registration made them changeable) —
+partial toggles are reported in the chat text, never fatal. A failed flag
+write skips the toggle (never half-disable). While fully paused, feedback
+button presses queue on Telegram and are drained after resume. `/news
+pause`/`/news resume` freeze the appliance alone. The error-streak
+auto-pause stays dispatch-only (a controller incident is not an appliance
+incident). `newsops.pause/resume` never raise — failures come back as chat
+text, so /pause always lands. Tests: TestPauseResume in test_news.py (fake
+`_app`/`_run`); test_workers' pause test stubs newsops.
 
 ## Implemented
 Tick orchestrator (Scheduled Task `engine-control-tick`, 1/min): `control.py`

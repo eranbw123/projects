@@ -37,9 +37,13 @@ def run_cmd(cmd: str, cwd, timeout=1800) -> tuple[int, str]:
     import os
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")  # keep checkouts clean
     try:
+        # CREATE_NO_WINDOW: validators runs windowless inside the worker tree
+        # (see worker_shim.NOWIN); without it this cmd child would open a
+        # visible console window on the owner's desktop per test run.
         p = subprocess.run(f'cmd /d /s /c "{cmd}"', cwd=cwd, env=env,
                            capture_output=True, text=True, errors="replace",
-                           timeout=timeout)
+                           timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
         return p.returncode, out
     except subprocess.TimeoutExpired:

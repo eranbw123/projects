@@ -77,6 +77,8 @@ HELP = (
     "/news set stocks|web|youtube <every: 45m|2h|1h30m>\n"
     "/news set max_scores N          (LLM calls per cycle)\n"
     "/news set bar <interest-key> <0.50-0.99>  (lower = more items)\n"
+    "/news pause — full freeze: tasks disabled + 0-spend flag (feedback "
+    "button presses queue, caught on resume) · /news resume — unfreeze\n"
     "/news help — this cheat sheet"
 )
 
@@ -242,6 +244,52 @@ def run(ctx, what: str) -> str:
     return f"▶️ triggered {', '.join(done)} — {tail}. /news for progress"
 
 
+def _toggle_tasks(enable: bool) -> tuple[int, int]:
+    """Best-effort schtasks enable/disable over the appliance tasks. Returns
+    (ok, total). A task registered from an elevated shell denies /change to
+    this unelevated process (observed live 2026-08-13, before a task
+    re-registration made them changeable again) -- failures are tolerated
+    because the in-app flag below is the actual 0-spend guarantee; this
+    layer only stops the 1s no-op python fires."""
+    ok = 0
+    for name in TASKS.values():
+        rc, _out = _run(["schtasks", "/change", "/tn", name,
+                         "/enable" if enable else "/disable"], timeout=30)
+        ok += rc == 0
+    return ok, len(TASKS)
+
+
+def pause(ctx) -> str:
+    """Freeze the appliance: set the in-app flag (`python -m app pause` --
+    run-once/web-tick/digest exit on it before building a provider, so 0
+    tokens even if a task still fires) AND best-effort-disable the scheduled
+    tasks. The flag is the guarantee; the task disable just silences the
+    no-op fires. Never raises -- failures come back as chat text."""
+    try:
+        rc, out = _app(ctx, "pause", "--why", "telegram /pause", timeout=60)
+    except Exception as e:  # noqa: BLE001 -- chat text, never break /pause
+        return f"news freeze FAILED: {e}"
+    if rc != 0:
+        return f"news freeze FAILED (rc={rc}): {out.strip()[:200]}"
+    ok, total = _toggle_tasks(enable=False)
+    note = f"tasks disabled {ok}/{total}" if ok == total else \
+        f"tasks disabled {ok}/{total} -- the pause flag still guarantees 0 spend"
+    return f"news appliance frozen ({note}; feedback buttons wake on resume)"
+
+
+def resume(ctx) -> str:
+    """Undo pause(): re-enable the tasks, then lift the flag. Same posture:
+    never raises."""
+    ok, total = _toggle_tasks(enable=True)
+    try:
+        rc, out = _app(ctx, "resume", timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return f"news resume FAILED (tasks re-enabled {ok}/{total}): {e}"
+    if rc != 0:
+        return f"news resume FAILED (rc={rc}, tasks re-enabled {ok}/{total}): {out.strip()[:200]}"
+    return f"news appliance resumed (tasks re-enabled {ok}/{total})"
+
+
 def config_text(ctx) -> str:
     env = _env_read(ctx)
     prov = env["DISCOVERY_PROVIDER"]
@@ -344,6 +392,10 @@ def command(ctx, sub: str, rest) -> str:
             return status(ctx)
         if sub == "run":
             return run(ctx, rest[0] if rest else "")
+        if sub == "pause":
+            return "⏸ " + pause(ctx)
+        if sub == "resume":
+            return "▶️ " + resume(ctx)
         if sub == "config":
             return config_text(ctx)
         if sub == "set":

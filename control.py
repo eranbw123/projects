@@ -2024,7 +2024,8 @@ def help_text() -> str:
         "/retry [step] — resume BLOCKED/ABORTED steps in-place (work kept; "
         "replans from scratch only when the worktree is gone)\n"
         "/abort [step] — stop a step for good (dependents halt)\n"
-        "/pause · /resume — dispatch gate (running workers finish)\n"
+        "/pause · /resume — all-stop token switch: worker dispatch gate + the "
+        "news appliance's LLM freeze (running workers finish)\n"
         "/go [step] — force-start a READY step through the usage-pressure "
         "hold (per-model caps still apply)\n"
         "/prs — GitHub PRs for validated work\n"
@@ -2078,8 +2079,10 @@ def handle_commands(ctx, conn, tg, cmds):
             db.kv_set(conn, "paused_why",
                       f"/pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
             running = len([r for r in db.open_runs(conn) if r["role"] != "probe"])
+            # All-stop: the same switch also freezes the news appliance's LLM
+            # spend (newsops.pause never raises -- failure comes back as text).
             tg.send(f"⏸ paused — {running} running worker(s) will finish; "
-                    "no new dispatch. /resume to continue")
+                    f"no new dispatch. {newsops.pause(ctx)}. /resume to continue")
         elif name == "/resume":
             db.kv_set(conn, "paused", "0")
             db.kv_set(conn, "paused_why", "")
@@ -2087,7 +2090,7 @@ def handle_commands(ctx, conn, tg, cmds):
                 if step["state"] == "WAITING_USER":
                     db.transition(conn, ctx, step["id"],
                                   db.step_detail(step).get("resume", "PENDING"), "/resume")
-            tg.send("▶️ resumed — dispatch continues next tick")
+            tg.send(f"▶️ resumed — dispatch continues next tick. {newsops.resume(ctx)}")
         elif name == "/retry":
             halted = [s for s in steps_all(conn) if s["state"] in common.HALT_STATES
                       and (arg is None or s["id"] == arg)]
@@ -2311,7 +2314,11 @@ def ensure_listener_task(ctx) -> None:
     minutes; the listener's byte lock makes redundant fires exit instantly,
     so this is restart-on-crash, not duplication."""
     import subprocess
-    cmd = f'"{sys.executable}" "{common.CODE_DIR / "tg_listener.py"}"'
+    # wscript + hidden.vbs: a bare python.exe action flashes a console window
+    # in the interactive session on every 5-minute fire; the GUI-subsystem
+    # host runs it with a hidden window and still propagates the exit code.
+    cmd = (f'wscript //B "{common.CODE_DIR / "hidden.vbs"}" '
+           f'"{sys.executable}" "{common.CODE_DIR / "tg_listener.py"}"')
     q = subprocess.run(["schtasks", "/query", "/tn", LISTENER_TASK, "/fo", "csv", "/nh"],
                        capture_output=True, text=True)
     if q.returncode != 0:
@@ -2389,7 +2396,11 @@ def cmd_start(ctx) -> int:
 
 def cmd_install_task(ctx):
     import subprocess
-    cmd = f'"{sys.executable}" "{common.CODE_DIR / "control.py"}" tick'
+    # Hidden launch (see ensure_listener_task): the tick fires every minute,
+    # so a visible console action here is the single worst window-flasher on
+    # the machine.
+    cmd = (f'wscript //B "{common.CODE_DIR / "hidden.vbs"}" '
+           f'"{sys.executable}" "{common.CODE_DIR / "control.py"}" tick')
     p = subprocess.run(["schtasks", "/create", "/tn", TICK_TASK, "/sc", "minute",
                         "/mo", "1", "/f", "/tr", cmd], capture_output=True, text=True)
     print(p.stdout.strip() or p.stderr.strip())
@@ -2545,11 +2556,11 @@ def main(argv=None):
         db.kv_set(conn, "paused", "1")
         db.kv_set(conn, "paused_why",
                   f"CLI pause at {common.local_str(common.now(), '%m-%d %H:%M')}")
-        print("paused")
+        print("paused; " + newsops.pause(ctx))
     elif args.cmd == "resume":
         db.kv_set(conn, "paused", "0")
         db.kv_set(conn, "paused_why", "")
-        print("resumed")
+        print("resumed; " + newsops.resume(ctx))
     elif args.cmd == "retry":
         class _T:  # reuse telegram handler without a bot
             def send(self, t): print(t)
