@@ -232,6 +232,47 @@ class TestRunAndRouting(NewsBase):
         self.assertIn("⚠ digest: not installed", out)
 
 
+class TestPauseResume(NewsBase):
+    def test_pause_sets_the_app_flag_then_disables_every_task(self):
+        out = newsops.command(self.ctx, "pause", [])
+        self.assertIn("frozen", out)
+        self.assertIn("6/6", out)
+        self.assertIn(["app", "pause", "--why", "telegram /pause"], self.calls)
+        disabled = [c[3] for c in self.calls
+                    if c[:3] == ["schtasks", "/change", "/tn"] and c[4] == "/disable"]
+        self.assertEqual(sorted(disabled), sorted(newsops.TASKS.values()))
+
+    def test_resume_reenables_every_task_and_lifts_the_flag(self):
+        out = newsops.command(self.ctx, "resume", [])
+        self.assertIn("resumed", out)
+        self.assertIn("6/6", out)
+        self.assertIn(["app", "resume"], self.calls)
+        enabled = [c[3] for c in self.calls
+                   if c[:3] == ["schtasks", "/change", "/tn"] and c[4] == "/enable"]
+        self.assertEqual(sorted(enabled), sorted(newsops.TASKS.values()))
+
+    def test_pause_flag_failure_skips_the_task_toggle(self):
+        # A failed freeze must not half-disable the tasks: the flag is the
+        # guarantee, so nothing else should change when it doesn't land.
+        def bad_app(ctx, *args, timeout=90):
+            return 1, "boom"
+
+        newsops._app = bad_app
+        out = newsops.command(self.ctx, "pause", [])
+        self.assertIn("FAILED", out)
+        self.assertFalse(any(c[0] == "schtasks" for c in self.calls))
+
+    def test_pause_failure_comes_back_as_chat_text(self):
+        def bad_app(ctx, *args, timeout=90):
+            return 1, "boom"
+
+        newsops._app = bad_app
+        out = newsops.command(self.ctx, "pause", [])
+        self.assertIn("FAILED", out)
+        out = newsops.command(self.ctx, "resume", [])
+        self.assertIn("FAILED", out)
+
+
 class TestHelpCoverage(unittest.TestCase):
     """Help must never drift from the actual routing: these tests parse the
     real dispatch code, so adding a command without updating /help (or the

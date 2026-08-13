@@ -241,3 +241,501 @@ steps:
     acceptance: |
       Audit verdict PASS with no critical/major findings; findings and
       implications recorded in the handoff.
+
+  - id: step-12
+    ordinal: 13
+    title: Continuous council-driven web discovery
+    repos: [internet]
+    depends_on: []
+    objective: |
+      Replace production web discovery's periodic single-static-prompt
+      retrieval path with a durable, continuously executed queue of
+      council-generated research missions.
+
+      This is a production feature, not an experiment. Do not create an
+      old-vs-new baseline, A/B arms, promotion gate, evaluator framework,
+      or statistical quality proof.
+
+      First reconcile the post-MVP automation/integration tip with the
+      already-working chatgpt_browser provider currently present on main.
+      The completed implementation must contain both bodies of work.
+
+      Reuse the existing main LLM Council design from the sibling ai repo:
+      five independent advisors (Contrarian, First-Principles,
+      Expansionist, Outsider, Executor), anonymized peer review, and
+      Chairman synthesis. Port the stable Council reasoning instructions
+      into an internet-owned module; internet must not runtime-import the
+      ai application.
+
+      For each owner interest, Council planning must receive:
+      - the complete owner interest definition;
+      - a bounded recent discovery frontier;
+      - bounded recent explicit user feedback;
+      - the previous bounded set of generated search missions.
+
+      The Chairman must return a configurable batch of genuinely distinct
+      research missions, each containing label, rationale and a complete
+      executor prompt.
+
+      Search generations and missions are durable runtime state. Persist
+      enough information to resume them after process death, machine sleep,
+      provider failure or restart and to recover the exact producing
+      mission for a later CandidateItem.
+
+      Replace the scheduled web collector's current full-interest batch
+      semantics with a short-lived `web-tick` execution model. Keep the
+      existing Windows Scheduled Task name/control surface, but run it at
+      one-minute cadence.
+
+      Every web tick must:
+      1. recover stale mission leases;
+      2. replenish at most one interest whose mission queue is below its
+         low-water mark;
+      3. select eligible pending work fairly across owner interests;
+      4. transactionally lease a bounded number of missions;
+      5. execute each mission independently using the configured
+         search-capable ChatGPT provider;
+      6. attach generation/mission provenance to returned CandidateItems;
+      7. feed candidates through the existing normalize -> dedup ->
+         persist -> matching -> prefilter -> scoring -> exploit/explore
+         budget -> threshold -> notification machinery;
+      8. persist mission completion/failure and provider usage.
+
+      Council generation must not occur every minute for every interest.
+      It replenishes a durable reservoir of missions. Continuous execution
+      means advancing that reservoir every tick, not regenerating the same
+      interest prompt repeatedly.
+
+      Mission selection must provide cross-interest fairness so a large
+      queue for one interest cannot starve others.
+
+      Search executors must treat Council prompts as research missions,
+      not literal single search queries: they may iteratively search,
+      follow discovered entities/terminology/references, and return several
+      genuinely distinct candidate discoveries.
+
+      Existing scoring, feedback, dynamic-interest, exploration-lane,
+      Telegram message-format and YouTube semantics remain intact except
+      for the minimum refactoring required to reuse the existing ingest
+      pipeline from the web mission runtime.
+
+      Keep the legacy static web-search prompt only as bounded fallback
+      when Council generation fails repeatedly.
+    acceptance: |
+      - Post-MVP features and chatgpt_browser coexist on the integration tip.
+
+      - The installed web Scheduled Task runs the new bounded `web-tick`
+        path at approximately one-minute cadence rather than running the
+        complete static web collector across every interest.
+
+      - Empty startup self-populates mission queues without a burst across
+        all interests.
+
+      - Council generation uses the existing five-advisor + peer-review +
+        Chairman reasoning architecture and returns strict structured
+        missions.
+
+      - Council context contains recent discoveries, recent explicit
+        feedback, and previous mission history while excluding downstream
+        score thresholds/weight targets.
+
+      - Search generations/missions survive process death and restart.
+
+      - A stale RUNNING mission can be safely reclaimed without duplicate
+        concurrent execution.
+
+      - One failed planner or executor call does not stop unrelated
+        interests or missions.
+
+      - Mission execution is fair across interests.
+
+      - Every discovered CandidateItem can be traced to its generation,
+        mission label and exact prompt/hash.
+
+      - Returned discoveries pass through the existing production pipeline;
+        no parallel scorer, deduper or notifier is introduced.
+
+      - Current separate exploit/explore score budgets continue to work.
+
+      - Default tuning is configurable without modifying interests.json:
+        mission batch size, low-water mark, missions per tick, search uses
+        per mission, results per mission, frontier size, feedback-context
+        size and retry/lease timing.
+
+      - Operational tests cover startup refill, round-robin fairness,
+        queue refill, crash/recovery, stale lease recovery, planner failure,
+        malformed Council output, executor failure, duplicate discoveries,
+        provenance, provider outage, and a stubbed full web-tick ->
+        CandidateItem -> scoring pipeline run.
+
+      - Existing canonical test suites remain green.
+
+      - No A/B/baseline/quality-comparison framework is added.
+
+  - id: step-13
+    ordinal: 14
+    title: Interactive discovery observatory
+    repos: [internet]
+    depends_on: [step-12]
+    models: {planner: fable}
+
+    objective: |
+      Build a detailed, local-first web application that makes every discovery
+      visually and causally inspectable.
+
+      The primary product is an INTERACTIVE FLOWCHART of the exact execution
+      graph—not a numbered timeline and not a generic dashboard.
+
+      From any Telegram discovery, candidate, mission, generation or interest,
+      the owner must be able to open one page and see the complete branching
+      path that produced it:
+
+        interest state
+          -> Council context
+          -> exact Council prompt
+          -> explicit Council deliberation
+          -> Chairman decision
+          -> generated missions
+          -> exact mission-executor prompt
+          -> web-search/tool events
+          -> every returned result
+          -> normalization
+          -> duplicate decision
+          -> persistence
+          -> all interest matches
+          -> prefilter
+          -> exact scoring/value prompt
+          -> explicit decision explanation
+          -> parsed result
+          -> threshold/delivery decision
+          -> exact Telegram rendering
+          -> Telegram response
+          -> later feedback
+
+      A Council call must branch into all generated missions. A mission must
+      branch into all returned results. Each result must branch through its own
+      pipeline. Duplicate, filtered, deferred, failed and unsent branches must
+      remain visible; the UI must not show only the successful Telegram path.
+
+      IMPLEMENTATION STACK
+
+      - Datasette runs directly against the live discovery.db and provides:
+        native table browsing, filtering, sorting, SQL inspection, row pages and
+        JSON APIs.
+      - A small in-repo Datasette plugin serves the custom observatory routes and
+        the compiled frontend.
+      - React + TypeScript + React Flow renders the graph.
+      - ELK.js performs left-to-right layered automatic layout after nodes are
+        expanded or collapsed.
+      - Vite builds static assets committed or packaged with the Python plugin.
+      - The UI is read-only. It must never mutate discovery state.
+      - Datasette must not run in immutable mode because discovery.db continues
+        changing while the UI is open.
+      - Add:
+          python -m app ui --host 127.0.0.1 --port 8001
+      - Add an optional authenticated ngrok launch path:
+          python -m app ui --public
+        It must require configured authentication and never expose the database
+        anonymously.
+
+      TRACE STORAGE
+
+      Add append-only, additive SQLite tables:
+
+      1. trace_runs
+         - id
+         - command/job type
+         - provider/model configuration
+         - redacted configuration snapshot
+         - started_at / finished_at
+         - status / error
+
+      2. trace_nodes
+         - id
+         - run_id
+         - node_type
+         - entity_type / entity_id
+         - label
+         - status
+         - summary
+         - input_json
+         - output_json
+         - exact_text
+         - started_at / finished_at
+         - error
+
+      3. trace_edges
+         - from_node_id
+         - to_node_id
+         - relationship
+         - ordinal
+
+         Relationships include:
+         generated, selected, executed, returned, normalized_to, duplicate_of,
+         matched, rejected, deferred, scored, cleared_threshold, rendered,
+         sent, failed, retried_as and feedback_on.
+
+      4. model_calls
+         - trace_node_id
+         - call_role: council | mission_search | scoring | value_distillation
+         - attempt
+         - provider / model
+         - exact_system_prompt
+         - exact_user_prompt
+         - exact_schema_json
+         - exact_parameters_json
+         - raw_response_text
+         - parsed_response_json
+         - validation_result
+         - usage_json
+         - provider_request_id where available
+         - started_at / finished_at
+         - error
+
+      Every retry is a separate model_calls row. Never overwrite an earlier
+      failed attempt.
+
+      Instrument provider calls centrally through the provider abstraction,
+      rather than manually duplicating logging in Council, missions and scoring.
+      Capture the exact final prompt after all framing, schema suffixes and retry
+      instructions have been applied.
+
+      Extend browser-provider parsing to retain every observable search/tool
+      event exposed in the streamed response: search query, tool start/end,
+      citations, result URLs, snippets and failures. When a provider does not
+      expose an internal search event, render an explicit
+      "not exposed by provider" node. Never fabricate the missing event.
+
+      Create a trace node before deduplication so even a raw result rejected as
+      a duplicate has a persistent observable branch.
+
+      EXPLICIT REASONING VISIBILITY
+
+      The current Council intentionally hides its five advisor answers, peer
+      reviews and Chairman synthesis. Change the Council response contract so
+      the same call explicitly returns and persists:
+
+      - five named advisor analyses;
+      - the anonymized peer-review critiques and rankings;
+      - aggregate ranking;
+      - disagreements and rejected mission angles;
+      - Chairman synthesis and mission-selection rationale;
+      - final missions consumed by production.
+
+      These fields are visible structured deliberation artifacts. Do not claim
+      that provider-private hidden chain-of-thought is available. Anything not
+      returned by the provider must be marked unavailable.
+
+      The scoring/value call must similarly return, in the same existing call:
+
+      - evidence used;
+      - chosen interest and why;
+      - rationale for each score or future value field;
+      - important alternative interpretation considered;
+      - why the result was not scored higher;
+      - uncertainties and missing evidence;
+      - final structured output consumed by production.
+
+      This observability must add no extra LLM calls. The richer debug payload
+      is returned by the calls already being made.
+
+      WEB EXPERIENCE
+
+      The default page is a full-screen three-pane observatory:
+
+      LEFT — DISCOVERY EXPLORER
+
+      - Search across titles, URLs, bottom lines, prompts and model outputs.
+      - Filters for date, interest, layer, source, provider, model, mission,
+        sent/not-sent, feedback verdict, failure stage and trace completeness.
+      - Rows show timestamp, interest, discovery title/bottom line, final state,
+        score/value strength, Telegram state and feedback.
+      - Tabs:
+          Discoveries
+          Interests
+          Council generations
+          Missions
+          Failed runs
+          Raw database
+      - Selecting any row loads its graph without navigating away.
+
+      CENTER — INTERACTIVE FLOWCHART
+
+      - Horizontal left-to-right execution graph.
+      - Swimlanes:
+          Personal/interest state
+          Council
+          Mission execution
+          Candidate pipeline
+          Scoring/value
+          Delivery/feedback
+      - The path leading to the selected Telegram output is emphasized.
+      - Sibling missions, search results and rejected candidates remain visible
+        but may initially appear as collapsed groups.
+      - Double-click expands/collapses a group.
+      - "Expand all" reveals every real event.
+      - "Focus selected path" hides visual noise without deleting branches.
+      - Include zoom, pan, minimap, fit-to-view and reset-layout controls.
+      - Active/incomplete nodes visibly update through lightweight polling.
+      - Node cards display type, concise result, status, timestamp, duration and
+        child count.
+      - Edge labels state the real relationship, such as:
+          "generated mission"
+          "result #4"
+          "duplicate of"
+          "matched at 0.91"
+          "filtered because"
+          "0.84 >= historical threshold 0.75"
+      - No synthetic generic stage nodes. Every displayed node corresponds to
+        an actual persisted event, call, decision or database entity.
+
+      RIGHT — NODE INSPECTOR
+
+      Clicking any node opens a large inspector with tabs:
+
+      - Overview
+      - Exact input
+      - Exact output
+      - Raw response
+      - Parsed JSON
+      - Reasoning record
+      - Configuration
+      - Timing/usage
+      - Database rows
+
+      Long prompts and responses use a readable monospace viewer with:
+
+      - preserved whitespace;
+      - wrapping toggle;
+      - syntax-highlighted JSON;
+      - copy button;
+      - full-screen mode;
+      - download button;
+      - visible truncation warning if anything was not stored.
+
+      Every node includes direct links to its corresponding Datasette rows.
+      Every source-result node includes the source URL and the exact raw result
+      position returned by the executor.
+
+      INTEREST VIEW
+
+      Clicking an interest must show:
+
+      - the complete interest definition;
+      - layer and provenance;
+      - positive/negative signals;
+      - current configuration;
+      - interest-event history;
+      - Council contexts generated from it;
+      - every generation and mission;
+      - discoveries, failures and feedback associated with it.
+
+      COMPARISON MODE
+
+      Allow selecting two traces, Council generations, model calls or prompt
+      versions and display:
+
+      - side-by-side flowcharts;
+      - prompt diff;
+      - response diff;
+      - changed context fields;
+      - changed mission branches;
+      - changed score/value decisions;
+      - changed delivery outcome.
+
+      This is required so prompt optimization can be based on concrete
+      before/after behavior rather than memory.
+
+      TELEGRAM CONNECTION
+
+      When DISCOVERY_OBSERVATORY_BASE_URL is configured, append a URL button to
+      each Telegram item:
+
+          🔬 Open full trace
+
+      The URL deep-links directly to:
+
+          /observatory/trace/score/<score_id>
+
+      Preserve all existing feedback buttons. When no public base URL is
+      configured, omit the trace button.
+
+      MOBILE EXPERIENCE
+
+      The UI must work well on iPhone:
+
+      - discovery list becomes a slide-out drawer;
+      - graph remains touch-pan/zoom capable;
+      - node inspector becomes a full-screen bottom sheet;
+      - prompt/output text remains selectable and copyable;
+      - opening a Telegram trace link lands directly on the highlighted path.
+
+      SECURITY
+
+      - Bind to localhost by default.
+      - Public/ngrok mode requires authentication.
+      - Never persist cookies, authorization headers, API keys, Telegram tokens,
+        session tokens or Chrome authentication material.
+      - Redact secrets while preserving complete prompts, schemas, model
+        responses and non-secret request parameters.
+      - UI and Datasette access share the same authentication boundary.
+
+      Keep the graph schema extensible so the following Personal Value Updates
+      step can add target_hinge, value_mode, bottom_line and personal relevance
+      nodes without redesigning the observatory.
+
+    acceptance: |
+      A deterministic fixture creates one interest, one Council generation,
+      multiple advisor outputs, three missions, multiple search results and
+      branching candidate outcomes including:
+
+      - one duplicate;
+      - one prefilter rejection;
+      - one scoring failure followed by a retry;
+      - one score below threshold;
+      - one successful Telegram discovery with feedback.
+
+      Opening the successful discovery displays one connected interactive graph
+      containing every branch above—not only the winning path.
+
+      The exact prompts shown in the inspector are byte-for-byte equal to the
+      strings passed to the fake providers after all framing and retry suffixes.
+
+      Raw and parsed model responses are both visible. Failed attempts remain
+      visible after successful retries.
+
+      The Council node expands into five advisor records, peer-review records,
+      aggregate ranking, Chairman synthesis and final missions.
+
+      Every raw mission result maps unambiguously to either a candidate,
+      duplicate, error or rejection node.
+
+      Historical traces preserve the exact interest/configuration snapshot,
+      threshold and Telegram text used at the time, even after current
+      interests, prompts or thresholds change.
+
+      Datasette exposes every operational and trace table read-only, and each
+      graph node can open its relevant database rows.
+
+      Compare mode produces correct prompt, response and topology differences
+      between two fixture traces.
+
+      The Telegram deep link opens the correct score trace and highlights the
+      exact sent path.
+
+      Desktop and iPhone-sized browser tests verify list navigation, graph
+      pan/zoom, expand/collapse, inspector viewing and prompt copying.
+
+      Trace instrumentation makes no additional provider calls and does not
+      alter candidate ranking, deduplication, filtering, notification or
+      feedback behavior.
+
+      Secret-redaction tests prove that authentication tokens and cookies never
+      enter trace storage or API responses.
+
+      Large traces are lazy-loaded and remain usable: the discovery list is
+      paginated, collapsed groups do not fetch full child payloads until opened,
+      and opening a normal trace does not load the entire database.
+
+      The canonical discovery/watch suites, new trace tests, frontend tests and
+      one end-to-end browser smoke test are green.

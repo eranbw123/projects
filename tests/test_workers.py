@@ -153,12 +153,25 @@ class TestIdleReason(Base):
             def send(self, t):
                 sent.append(t)
 
-        control.handle_commands(self.sb.ctx(), conn, T(), ["/pause"])
-        self.assertIn("/pause at", db.kv_get(conn, "paused_why"))
-        control.handle_commands(self.sb.ctx(), conn, T(), ["/workers"])
-        self.assertIn("PAUSED: /pause at", sent[-1])
-        control.handle_commands(self.sb.ctx(), conn, T(), ["/resume"])
-        self.assertEqual(db.kv_get(conn, "paused_why"), "")
+        # /pause and /resume also flip the news appliance's flag through
+        # newsops (a real `python -m app` subprocess) — stub that boundary,
+        # same as test_news.py stubs _app.
+        news_calls = []
+        orig = (control.newsops.pause, control.newsops.resume)
+        control.newsops.pause = lambda ctx: news_calls.append("pause") or "news appliance frozen"
+        control.newsops.resume = lambda ctx: news_calls.append("resume") or "news appliance resumed"
+        try:
+            control.handle_commands(self.sb.ctx(), conn, T(), ["/pause"])
+            self.assertIn("/pause at", db.kv_get(conn, "paused_why"))
+            self.assertIn("news appliance frozen", sent[-1])
+            control.handle_commands(self.sb.ctx(), conn, T(), ["/workers"])
+            self.assertIn("PAUSED: /pause at", sent[-1])
+            control.handle_commands(self.sb.ctx(), conn, T(), ["/resume"])
+            self.assertEqual(db.kv_get(conn, "paused_why"), "")
+            self.assertIn("news appliance resumed", sent[-1])
+            self.assertEqual(news_calls, ["pause", "resume"])
+        finally:
+            control.newsops.pause, control.newsops.resume = orig
         conn.close()
 
     def test_quota_hold_wins_over_ready(self):
