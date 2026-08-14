@@ -157,9 +157,10 @@ class TestIdleReason(Base):
         # newsops (a real `python -m app` subprocess) — stub that boundary,
         # same as test_news.py stubs _app.
         news_calls = []
-        orig = (control.newsops.pause, control.newsops.resume)
+        orig = (control.newsops.pause, control.newsops.resume, control.start_sshd)
         control.newsops.pause = lambda ctx: news_calls.append("pause") or "news appliance frozen"
         control.newsops.resume = lambda ctx: news_calls.append("resume") or "news appliance resumed"
+        control.start_sshd = lambda: "ssh server already running"
         try:
             control.handle_commands(self.sb.ctx(), conn, T(), ["/pause"])
             self.assertIn("/pause at", db.kv_get(conn, "paused_why"))
@@ -169,10 +170,34 @@ class TestIdleReason(Base):
             control.handle_commands(self.sb.ctx(), conn, T(), ["/resume"])
             self.assertEqual(db.kv_get(conn, "paused_why"), "")
             self.assertIn("news appliance resumed", sent[-1])
+            self.assertIn("ssh server already running", sent[-1])
             self.assertEqual(news_calls, ["pause", "resume"])
         finally:
-            control.newsops.pause, control.newsops.resume = orig
+            control.newsops.pause, control.newsops.resume, control.start_sshd = orig
         conn.close()
+
+    def test_start_sshd_reports_each_outcome_and_never_raises(self):
+        from unittest import mock
+
+        def fake(returncode, stdout=""):
+            return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
+
+        # already running: query says RUNNING, no start attempted
+        with mock.patch("subprocess.run",
+                        side_effect=[fake(0, "STATE : 4  RUNNING")]) as m:
+            self.assertEqual(control.start_sshd(), "ssh server already running")
+            self.assertEqual(m.call_count, 1)
+        # stopped -> started
+        with mock.patch("subprocess.run",
+                        side_effect=[fake(0, "STATE : 1  STOPPED"), fake(0)]):
+            self.assertEqual(control.start_sshd(), "ssh server started")
+        # stopped -> denied (unelevated, no ACL grant yet): chat text, no raise
+        with mock.patch("subprocess.run",
+                        side_effect=[fake(0, "STATE : 1  STOPPED"),
+                                     fake(5, "Access is denied.")]):
+            out = control.start_sshd()
+            self.assertIn("NOT started", out)
+            self.assertIn("ACL grant", out)
 
     def test_quota_hold_wins_over_ready(self):
         conn = self.sb.conn()
