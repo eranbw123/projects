@@ -50,7 +50,12 @@ session, 2026-08-14), so a reboot alone never strands SSH again; the
 control-/engine-lab-, shortened to news·/ec·/lab·), per-task
 status/last-rc/last-run/next-run, deduped across per-trigger rows and
 repeated per-folder header rows, plus a live `sc query sshd` state in
-the header. Never raises — failures come back as the message text.
+the header and a trailing observatory line (`_observatory_line`): URL
+resolved live from ngrok's local API (127.0.0.1:4040, tunnel to :8010
+preferred — the public URL changes per ngrok restart, never hardcode
+it), falling back to the product .env's DISCOVERY_OBSERVATORY_BASE_URL,
+then bare http://127.0.0.1:8010; up/DOWN from a TCP probe of :8010.
+Never raises — failures come back as the message text.
 
 ## Implemented
 Tick orchestrator (Scheduled Task `engine-control-tick`, 1/min): `control.py`

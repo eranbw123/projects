@@ -226,13 +226,58 @@ class TestIdleReason(Base):
                 return mock.Mock(returncode=0, stdout=csv_out, stderr="")
             return mock.Mock(returncode=0, stdout="STATE : 1  STOPPED", stderr="")
 
-        with mock.patch("subprocess.run", side_effect=fake):
-            out = control.tasks_text()
+        orig = control._observatory_line
+        control._observatory_line = lambda ctx: "🔬 observatory DOWN · http://127.0.0.1:8010/observatory/"
+        try:
+            with mock.patch("subprocess.run", side_effect=fake):
+                out = control.tasks_text(self.sb.ctx())
+        finally:
+            control._observatory_line = orig
         self.assertIn("news·collect-web: Ready", out)
         self.assertIn("ec·start-sshd: Ready", out)
         self.assertNotIn("OneDrive", out)
         self.assertIn("sshd STOPPED", out)
+        self.assertIn("observatory", out)
         self.assertEqual(out.count("collect-web"), 1)  # deduped trigger rows
+
+    def test_observatory_line_prefers_the_live_ngrok_url(self):
+        import tempfile
+        import types
+        from unittest import mock
+
+        class FakeResp:
+            def __init__(self, payload):
+                self._p = payload
+
+            def read(self):
+                return self._p
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = types.SimpleNamespace(
+                getenv=lambda k, d=None: tmp if k == "EC_NEWS_ROOT" else d)
+            tunnels = json.dumps({"tunnels": [
+                {"public_url": "https://abc123.ngrok-free.app",
+                 "config": {"addr": "http://localhost:8010"}}]}).encode()
+            # ngrok up + server up: the public URL, marked up
+            with mock.patch("urllib.request.urlopen",
+                            return_value=FakeResp(tunnels)), \
+                 mock.patch("socket.create_connection",
+                            return_value=mock.MagicMock()):
+                line = control._observatory_line(ctx)
+            self.assertEqual(
+                line, "🔬 observatory up · https://abc123.ngrok-free.app/observatory/")
+            # ngrok down, no .env override, port closed: local URL, DOWN
+            with mock.patch("urllib.request.urlopen", side_effect=OSError), \
+                 mock.patch("socket.create_connection", side_effect=OSError):
+                line = control._observatory_line(ctx)
+            self.assertEqual(
+                line, "🔬 observatory DOWN · http://127.0.0.1:8010/observatory/")
 
     def test_tasks_command_routes_to_tasks_text(self):
         conn = self.sb.conn()
@@ -243,7 +288,7 @@ class TestIdleReason(Base):
                 sent.append(t)
 
         orig = control.tasks_text
-        control.tasks_text = lambda: "🗓 tasks (0) · sshd RUNNING"
+        control.tasks_text = lambda ctx: "🗓 tasks (0) · sshd RUNNING"
         try:
             control.handle_commands(self.sb.ctx(), conn, T(), ["/tasks"])
         finally:

@@ -2058,11 +2058,45 @@ _TASK_SHORT = (("internet-discovery-", "news·"), ("engine-control-", "ec·"),
                ("engine-lab-", "lab·"))
 
 
-def tasks_text() -> str:
+def _observatory_line(ctx) -> str:
+    """Observatory URL + liveness for /tasks. ops/observatory.cmd serves
+    127.0.0.1:8010 and a standing ngrok tunnel fronts it when running; the
+    public URL changes on every ngrok restart, so it is read live from
+    ngrok's local API (127.0.0.1:4040), falling back to the product .env's
+    DISCOVERY_OBSERVATORY_BASE_URL, then the bare local port. The :8010
+    probe is what says whether the server itself is up -- after a reboot
+    both it and ngrok are down until relaunched (hit live 2026-08-14)."""
+    import socket
+    import urllib.request
+    url = ""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
+            tunnels = json.loads(r.read().decode()).get("tunnels", [])
+        for t in tunnels:
+            if "8010" in ((t.get("config") or {}).get("addr") or ""):
+                url = t.get("public_url") or ""
+                break
+        if not url and tunnels:
+            url = tunnels[0].get("public_url") or ""
+    except Exception:  # noqa: BLE001 -- ngrok simply not running
+        pass
+    if not url:
+        url = newsops._env_read(ctx).get("DISCOVERY_OBSERVATORY_BASE_URL", "")
+    if not url:
+        url = "http://127.0.0.1:8010"
+    try:
+        with socket.create_connection(("127.0.0.1", 8010), timeout=2):
+            up = "up"
+    except OSError:
+        up = "DOWN"
+    return f"🔬 observatory {up} · {url.rstrip('/')}/observatory/"
+
+
+def tasks_text(ctx) -> str:
     """/tasks -- one phone-sized view of every Scheduled Task this machine's
     automation owns (news appliance, engine-control itself, lab one-shots,
-    the sshd starter) plus the ssh server's live state. One verbose
-    schtasks CSV query, not one query per task."""
+    the sshd starter) plus the ssh server's live state and the observatory
+    URL. One verbose schtasks CSV query, not one query per task."""
     import csv
     import io
     import subprocess
@@ -2095,7 +2129,9 @@ def tasks_text() -> str:
     except Exception:  # noqa: BLE001
         state = "unknown"
     header = f"🗓 tasks ({len(lines)}) · sshd {state}"
-    return "\n".join([header, *lines])[:3900] if lines else header + "\nno tasks found"
+    body = [header, *lines] if lines else [header, "no tasks found"]
+    body.append(_observatory_line(ctx))
+    return "\n".join(body)[:3900]
 
 
 def help_text() -> str:
@@ -2106,7 +2142,8 @@ def help_text() -> str:
         "/status — roadmap, plan, usage, every step\n"
         "/workers — live workers + recent runs\n"
         "/tasks — every automation Scheduled Task (news · engine · lab · "
-        "sshd starter) with status/last rc/next run, + ssh server state\n"
+        "sshd starter) with status/last rc/next run, + ssh server state "
+        "and the observatory URL\n"
         "/why [step] — failure story (default: last halted)\n"
         "/retry [step] — resume BLOCKED/ABORTED steps in-place (work kept; "
         "replans from scratch only when the worktree is gone)\n"
@@ -2165,7 +2202,7 @@ def handle_commands(ctx, conn, tg, cmds):
         elif name == "/workers":
             tg.send(workers_text(ctx, conn))
         elif name == "/tasks":
-            tg.send(tasks_text())
+            tg.send(tasks_text(ctx))
         elif name == "/pause":
             db.kv_set(conn, "paused", "1")
             db.kv_set(conn, "paused_why",
@@ -2644,7 +2681,7 @@ def main(argv=None):
     elif args.cmd == "workers":
         print(workers_text(ctx, conn))
     elif args.cmd == "tasks":
-        print(tasks_text())
+        print(tasks_text(ctx))
     elif args.cmd == "why":
         print(why_text(ctx, conn, args.target))
     elif args.cmd == "pause":
