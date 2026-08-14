@@ -24,6 +24,20 @@ incident). `newsops.pause/resume` never raise — failures come back as chat
 text, so /pause always lands. Tests: TestPauseResume in test_news.py (fake
 `_app`/`_run`); test_workers' pause test stubs newsops.
 
+`/resume` also best-effort-starts the SSH server (`control.start_sshd`:
+`sc query`/`sc start sshd`, chat-text outcomes, never raises) — a reboot
+leaves the Manual-start sshd stopped and the owner locked out (hit live:
+reboot 8/13 19:31). The controller is unelevated, so the start only works
+after a ONE-TIME elevated service-ACL grant adding RP (start) for
+Interactive Users; run once in an admin shell (SD read from `sc sdshow
+sshd` 2026-08-14, with RP inserted into the IU ACE):
+```
+sc.exe sdset sshd "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"
+```
+Also recommended: `Set-Service sshd -StartupType Automatic` so a reboot
+alone never strands SSH again (an Aug-8 sshd reinstall reset it to
+Manual, which is what caused the lockout).
+
 ## Implemented
 Tick orchestrator (Scheduled Task `engine-control-tick`, 1/min): `control.py`
 (DAG scheduler + step state machine + CLI) · `capacity.py` (plan detection,

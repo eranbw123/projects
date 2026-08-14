@@ -2013,6 +2013,31 @@ def rearm_step(ctx, conn, step) -> str:
     return f"{step['id']} re-armed from scratch (cycle {d['cycle']})"
 
 
+def start_sshd() -> str:
+    """Best-effort `sc start sshd` on /resume. The owner reconnects over SSH
+    and a reboot leaves the Manual-start service stopped (hit live
+    2026-08-14: reboot 8/13 19:31, port 22 dead until noticed). This
+    controller runs unelevated, so the start only succeeds after the
+    one-time elevated service-ACL grant adding RP (start) for Interactive
+    Users (see PROJECT_STATE.md); until then the denial comes back as chat
+    text -- never raises, never blocks the rest of /resume."""
+    import subprocess
+    try:
+        q = subprocess.run(["sc", "query", "sshd"], capture_output=True,
+                           text=True, errors="replace", timeout=15)
+        if "RUNNING" in (q.stdout or ""):
+            return "ssh server already running"
+        s = subprocess.run(["sc", "start", "sshd"], capture_output=True,
+                           text=True, errors="replace", timeout=15)
+        if s.returncode == 0:
+            return "ssh server started"
+        detail = " ".join(((s.stdout or "") + (s.stderr or "")).split())[:120]
+        return (f"ssh server NOT started (rc={s.returncode}: {detail}) -- "
+                "needs the one-time elevated ACL grant, see PROJECT_STATE.md")
+    except Exception as e:  # noqa: BLE001 -- chat text, never break /resume
+        return f"ssh server check failed: {e}"
+
+
 def help_text() -> str:
     # tests/test_news.py TestHelpCoverage pins this text to the actual command
     # routing: adding a command without listing it here fails the suite.
@@ -2028,7 +2053,7 @@ def help_text() -> str:
         "appliance frozen (0-spend flag + its scheduled tasks disabled; "
         "running workers finish)\n"
         "/resume — undo /pause: re-enable the news tasks, lift the freeze, "
-        "dispatch continues next tick\n"
+        "start the ssh server, dispatch continues next tick\n"
         "/go [step] — force-start a READY step through the usage-pressure "
         "hold (per-model caps still apply)\n"
         "/prs — GitHub PRs for validated work\n"
@@ -2093,7 +2118,8 @@ def handle_commands(ctx, conn, tg, cmds):
                 if step["state"] == "WAITING_USER":
                     db.transition(conn, ctx, step["id"],
                                   db.step_detail(step).get("resume", "PENDING"), "/resume")
-            tg.send(f"▶️ resumed — dispatch continues next tick. {newsops.resume(ctx)}")
+            tg.send(f"▶️ resumed — dispatch continues next tick. "
+                    f"{newsops.resume(ctx)}. {start_sshd()}")
         elif name == "/retry":
             halted = [s for s in steps_all(conn) if s["state"] in common.HALT_STATES
                       and (arg is None or s["id"] == arg)]
@@ -2563,7 +2589,7 @@ def main(argv=None):
     elif args.cmd == "resume":
         db.kv_set(conn, "paused", "0")
         db.kv_set(conn, "paused_why", "")
-        print("resumed; " + newsops.resume(ctx))
+        print("resumed; " + newsops.resume(ctx) + "; " + start_sshd())
     elif args.cmd == "retry":
         class _T:  # reuse telegram handler without a bot
             def send(self, t): print(t)
