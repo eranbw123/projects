@@ -45,6 +45,18 @@ schtasks /create /tn engine-control-start-sshd /xml $env:TEMP\s.xml /f
 session, 2026-08-14), so a reboot alone never strands SSH again; the
 /resume start is the belt-and-braces recovery + phone-visible check.
 
+`/resume` also starts the Observatory + ngrok when :8010 is down
+(`control.start_observatory`, live-verified 2026-08-14): pulls the
+standing on-demand task `engine-control-observatory`
+(scripts/observatory-task.xml, UNELEVATED so re-registration needs no
+admin, `ExecutionTimeLimit PT0S` — the task IS the server's lifetime,
+stop with `schtasks /end /tn engine-control-observatory`), whose action
+runs scripts/observatory_up.cmd = `ngrok http 8010` beside
+`ops/observatory.cmd`, then polls :8010 and hands back the fresh ngrok
+public URL in the reply. Note the standing posture this inherits: `ui`
+runs WITHOUT --public/token through the tunnel (same as the deployment
+always ran); the random ngrok hostname is the only gate.
+
 `/tasks` (Telegram + `control.py tasks`): one `schtasks /query /fo csv
 /v` pass filtered to `TASK_PREFIXES` (internet-discovery-/engine-
 control-/engine-lab-, shortened to news·/ec·/lab·), per-task

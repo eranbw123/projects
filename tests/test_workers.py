@@ -157,10 +157,12 @@ class TestIdleReason(Base):
         # newsops (a real `python -m app` subprocess) — stub that boundary,
         # same as test_news.py stubs _app.
         news_calls = []
-        orig = (control.newsops.pause, control.newsops.resume, control.start_sshd)
+        orig = (control.newsops.pause, control.newsops.resume,
+                control.start_sshd, control.start_observatory)
         control.newsops.pause = lambda ctx: news_calls.append("pause") or "news appliance frozen"
         control.newsops.resume = lambda ctx: news_calls.append("resume") or "news appliance resumed"
         control.start_sshd = lambda: "ssh server already running"
+        control.start_observatory = lambda ctx: "observatory started · https://x/observatory/"
         try:
             control.handle_commands(self.sb.ctx(), conn, T(), ["/pause"])
             self.assertIn("/pause at", db.kv_get(conn, "paused_why"))
@@ -171,9 +173,11 @@ class TestIdleReason(Base):
             self.assertEqual(db.kv_get(conn, "paused_why"), "")
             self.assertIn("news appliance resumed", sent[-1])
             self.assertIn("ssh server already running", sent[-1])
+            self.assertIn("observatory started", sent[-1])
             self.assertEqual(news_calls, ["pause", "resume"])
         finally:
-            control.newsops.pause, control.newsops.resume, control.start_sshd = orig
+            (control.newsops.pause, control.newsops.resume,
+             control.start_sshd, control.start_observatory) = orig
         conn.close()
 
     def test_start_sshd_reports_each_outcome_and_never_raises(self):
@@ -278,6 +282,39 @@ class TestIdleReason(Base):
                 line = control._observatory_line(ctx)
             self.assertEqual(
                 line, "🔬 observatory DOWN · http://127.0.0.1:8010/observatory/")
+
+    def test_start_observatory_outcomes(self):
+        from unittest import mock
+        ctx = self.sb.ctx()
+        # already up: no task trigger, current URL handed back
+        with mock.patch.object(control, "_port_up", return_value=True), \
+             mock.patch.object(control, "_observatory_url",
+                               return_value="https://abc.ngrok-free.app"):
+            self.assertEqual(
+                control.start_observatory(ctx),
+                "observatory already up · https://abc.ngrok-free.app/observatory/")
+        # down -> task triggered -> port up -> fresh ngrok URL
+        ports = iter([False, True])
+        with mock.patch.object(control, "_port_up",
+                               side_effect=lambda *a, **k: next(ports)), \
+             mock.patch.object(control, "_ngrok_public_url",
+                               return_value="https://abc.ngrok-free.app"), \
+             mock.patch("time.sleep"), \
+             mock.patch("subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout="", stderr="")) as m:
+            self.assertEqual(
+                control.start_observatory(ctx),
+                "observatory started · https://abc.ngrok-free.app/observatory/")
+            self.assertEqual(m.call_args_list[0].args[0],
+                             ["schtasks", "/run", "/tn", control.OBS_TASK])
+        # task missing/denied: chat text with the fix, no raise
+        with mock.patch.object(control, "_port_up", return_value=False), \
+             mock.patch("subprocess.run",
+                        return_value=mock.Mock(returncode=1,
+                                               stdout="ERROR: no task", stderr="")):
+            out = control.start_observatory(ctx)
+            self.assertIn("observatory task failed", out)
+            self.assertIn("re-register", out)
 
     def test_tasks_command_routes_to_tasks_text(self):
         conn = self.sb.conn()

@@ -2058,38 +2058,91 @@ _TASK_SHORT = (("internet-discovery-", "news·"), ("engine-control-", "ec·"),
                ("engine-lab-", "lab·"))
 
 
-def _observatory_line(ctx) -> str:
-    """Observatory URL + liveness for /tasks. ops/observatory.cmd serves
-    127.0.0.1:8010 and a standing ngrok tunnel fronts it when running; the
-    public URL changes on every ngrok restart, so it is read live from
-    ngrok's local API (127.0.0.1:4040), falling back to the product .env's
-    DISCOVERY_OBSERVATORY_BASE_URL, then the bare local port. The :8010
-    probe is what says whether the server itself is up -- after a reboot
-    both it and ngrok are down until relaunched (hit live 2026-08-14)."""
+OBS_TASK = "engine-control-observatory"
+
+
+def _port_up(port, timeout=2) -> bool:
     import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ngrok_public_url() -> str:
+    """The live public URL from ngrok's local API -- it changes on every
+    ngrok restart, so it is never stored anywhere. Empty when ngrok is
+    down (or has no tunnels)."""
     import urllib.request
-    url = ""
     try:
         with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
             tunnels = json.loads(r.read().decode()).get("tunnels", [])
-        for t in tunnels:
-            if "8010" in ((t.get("config") or {}).get("addr") or ""):
-                url = t.get("public_url") or ""
-                break
-        if not url and tunnels:
-            url = tunnels[0].get("public_url") or ""
     except Exception:  # noqa: BLE001 -- ngrok simply not running
-        pass
-    if not url:
-        url = newsops._env_read(ctx).get("DISCOVERY_OBSERVATORY_BASE_URL", "")
-    if not url:
-        url = "http://127.0.0.1:8010"
+        return ""
+    for t in tunnels:
+        if "8010" in ((t.get("config") or {}).get("addr") or ""):
+            return t.get("public_url") or ""
+    return (tunnels[0].get("public_url") or "") if tunnels else ""
+
+
+def _observatory_url(ctx) -> str:
+    """Best URL for the Observatory: live ngrok public URL, else the product
+    .env's DISCOVERY_OBSERVATORY_BASE_URL, else the bare local port
+    (ops/observatory.cmd serves 127.0.0.1:8010)."""
+    return (_ngrok_public_url()
+            or newsops._env_read(ctx).get("DISCOVERY_OBSERVATORY_BASE_URL", "")
+            or "http://127.0.0.1:8010")
+
+
+def _observatory_line(ctx) -> str:
+    """Observatory URL + liveness for /tasks; the :8010 probe is what says
+    whether the server itself is up -- after a reboot both it and ngrok
+    are down until relaunched (hit live 2026-08-14, now covered by
+    start_observatory on /resume)."""
+    up = "up" if _port_up(8010) else "DOWN"
+    return f"🔬 observatory {up} · {_observatory_url(ctx).rstrip('/')}/observatory/"
+
+
+def start_observatory(ctx) -> str:
+    """Best-effort Observatory + ngrok start on /resume. Both die with a
+    reboot (ops/observatory.cmd is a manual launcher; hit live 2026-08-14:
+    down ~18h unnoticed). Mechanism mirrors start_sshd, minus elevation:
+    the standing on-demand task OBS_TASK (scripts/observatory-task.xml,
+    unelevated, ExecutionTimeLimit PT0S -- the task IS the server's
+    lifetime; stop with `schtasks /end`) runs scripts/observatory_up.cmd =
+    `ngrok http 8010` beside ops/observatory.cmd. Pull the trigger, poll
+    :8010, then hand back the fresh public URL (ngrok's API answers a few
+    seconds after uvicorn, hence the second poll). Never raises."""
+    import subprocess
+    import time
     try:
-        with socket.create_connection(("127.0.0.1", 8010), timeout=2):
-            up = "up"
-    except OSError:
-        up = "DOWN"
-    return f"🔬 observatory {up} · {url.rstrip('/')}/observatory/"
+        if _port_up(8010):
+            return ("observatory already up · "
+                    f"{_observatory_url(ctx).rstrip('/')}/observatory/")
+        t = subprocess.run(["schtasks", "/run", "/tn", OBS_TASK],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=15)
+        if t.returncode != 0:
+            detail = " ".join(((t.stdout or "") + (t.stderr or "")).split())[:120]
+            return (f"observatory task failed (rc={t.returncode}: {detail}) -- "
+                    f"re-register {OBS_TASK}, see PROJECT_STATE.md")
+        for _ in range(15):
+            time.sleep(1)
+            if _port_up(8010):
+                break
+        else:
+            return ("observatory task triggered but :8010 is not up yet -- "
+                    "/tasks to check")
+        for _ in range(8):
+            url = _ngrok_public_url()
+            if url:
+                return f"observatory started · {url.rstrip('/')}/observatory/"
+            time.sleep(1)
+        return ("observatory started · http://127.0.0.1:8010/observatory/ "
+                "(ngrok url pending -- /tasks in a moment)")
+    except Exception as e:  # noqa: BLE001 -- chat text, never break /resume
+        return f"observatory start failed: {e}"
 
 
 def tasks_text(ctx) -> str:
@@ -2152,7 +2205,8 @@ def help_text() -> str:
         "appliance frozen (0-spend flag + its scheduled tasks disabled; "
         "running workers finish)\n"
         "/resume — undo /pause: re-enable the news tasks, lift the freeze, "
-        "start the ssh server, dispatch continues next tick\n"
+        "start the ssh server and the observatory+ngrok (fresh public URL "
+        "in the reply), dispatch continues next tick\n"
         "/go [step] — force-start a READY step through the usage-pressure "
         "hold (per-model caps still apply)\n"
         "/prs — GitHub PRs for validated work\n"
@@ -2220,7 +2274,7 @@ def handle_commands(ctx, conn, tg, cmds):
                     db.transition(conn, ctx, step["id"],
                                   db.step_detail(step).get("resume", "PENDING"), "/resume")
             tg.send(f"▶️ resumed — dispatch continues next tick. "
-                    f"{newsops.resume(ctx)}. {start_sshd()}")
+                    f"{newsops.resume(ctx)}. {start_sshd()}. {start_observatory(ctx)}")
         elif name == "/retry":
             halted = [s for s in steps_all(conn) if s["state"] in common.HALT_STATES
                       and (arg is None or s["id"] == arg)]
@@ -2692,7 +2746,8 @@ def main(argv=None):
     elif args.cmd == "resume":
         db.kv_set(conn, "paused", "0")
         db.kv_set(conn, "paused_why", "")
-        print("resumed; " + newsops.resume(ctx) + "; " + start_sshd())
+        print("resumed; " + newsops.resume(ctx) + "; " + start_sshd()
+              + "; " + start_observatory(ctx))
     elif args.cmd == "retry":
         class _T:  # reuse telegram handler without a bot
             def send(self, t): print(t)
