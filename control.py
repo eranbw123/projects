@@ -2013,29 +2013,89 @@ def rearm_step(ctx, conn, step) -> str:
     return f"{step['id']} re-armed from scratch (cycle {d['cycle']})"
 
 
+SSHD_TASK = "engine-control-start-sshd"
+
+
 def start_sshd() -> str:
-    """Best-effort `sc start sshd` on /resume. The owner reconnects over SSH
-    and a reboot leaves the Manual-start service stopped (hit live
+    """Best-effort SSH-server start on /resume. The owner reconnects over
+    SSH and a reboot leaves the Manual-start service stopped (hit live
     2026-08-14: reboot 8/13 19:31, port 22 dead until noticed). This
-    controller runs unelevated, so the start only succeeds after the
-    one-time elevated service-ACL grant adding RP (start) for Interactive
-    Users (see PROJECT_STATE.md); until then the denial comes back as chat
-    text -- never raises, never blocks the rest of /resume."""
+    controller runs unelevated and the service denies it a direct start, so
+    the mechanism is the standing on-demand Scheduled Task SSHD_TASK --
+    registered ONCE from an elevated shell (XML + procedure in
+    PROJECT_STATE.md), RunLevel HighestAvailable, action `sc start sshd`
+    via hidden.vbs -- whose trigger this process is allowed to pull. Pull,
+    then poll the service state briefly. Never raises, never blocks the
+    rest of /resume."""
     import subprocess
+    import time
+
+    def run(args):
+        return subprocess.run(args, capture_output=True, text=True,
+                              errors="replace", timeout=15)
+
+    try:
+        if "RUNNING" in (run(["sc", "query", "sshd"]).stdout or ""):
+            return "ssh server already running"
+        t = run(["schtasks", "/run", "/tn", SSHD_TASK])
+        if t.returncode != 0:
+            detail = " ".join(((t.stdout or "") + (t.stderr or "")).split())[:120]
+            return (f"ssh start task failed (rc={t.returncode}: {detail}) -- "
+                    f"re-register {SSHD_TASK} from an elevated shell, see "
+                    "PROJECT_STATE.md")
+        for _ in range(10):
+            time.sleep(1)
+            if "RUNNING" in (run(["sc", "query", "sshd"]).stdout or ""):
+                return "ssh server started"
+        return ("ssh start task triggered but sshd is not RUNNING yet -- "
+                "/tasks to check")
+    except Exception as e:  # noqa: BLE001 -- chat text, never break /resume
+        return f"ssh server check failed: {e}"
+
+
+TASK_PREFIXES = ("internet-discovery-", "engine-control-", "engine-lab-")
+_TASK_SHORT = (("internet-discovery-", "news·"), ("engine-control-", "ec·"),
+               ("engine-lab-", "lab·"))
+
+
+def tasks_text() -> str:
+    """/tasks -- one phone-sized view of every Scheduled Task this machine's
+    automation owns (news appliance, engine-control itself, lab one-shots,
+    the sshd starter) plus the ssh server's live state. One verbose
+    schtasks CSV query, not one query per task."""
+    import csv
+    import io
+    import subprocess
+    try:
+        p = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v"],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=30)
+        rows = csv.DictReader(io.StringIO(p.stdout or ""))
+        seen, lines = set(), []
+        for r in rows:
+            name = (r.get("TaskName") or "").lstrip("\\")
+            if name == "TaskName" or not name.startswith(TASK_PREFIXES):
+                continue  # repeated per-folder header rows, foreign tasks
+            if name in seen:
+                continue  # one row per trigger; first wins
+            seen.add(name)
+            for long, short in _TASK_SHORT:
+                name = name.replace(long, short, 1)
+            lines.append(f"{name}: {r.get('Status') or '?'}"
+                         f" · last rc {(r.get('Last Result') or '?').strip()}"
+                         f" @ {(r.get('Last Run Time') or '?').strip()}"
+                         f" · next {(r.get('Next Run Time') or '-').strip()}")
+        lines.sort()
+    except Exception as e:  # noqa: BLE001 -- a readout must never crash
+        return f"tasks: schtasks failed: {e}"
     try:
         q = subprocess.run(["sc", "query", "sshd"], capture_output=True,
                            text=True, errors="replace", timeout=15)
-        if "RUNNING" in (q.stdout or ""):
-            return "ssh server already running"
-        s = subprocess.run(["sc", "start", "sshd"], capture_output=True,
-                           text=True, errors="replace", timeout=15)
-        if s.returncode == 0:
-            return "ssh server started"
-        detail = " ".join(((s.stdout or "") + (s.stderr or "")).split())[:120]
-        return (f"ssh server NOT started (rc={s.returncode}: {detail}) -- "
-                "needs the one-time elevated ACL grant, see PROJECT_STATE.md")
-    except Exception as e:  # noqa: BLE001 -- chat text, never break /resume
-        return f"ssh server check failed: {e}"
+        state = "RUNNING" if "RUNNING" in (q.stdout or "") else "STOPPED"
+    except Exception:  # noqa: BLE001
+        state = "unknown"
+    header = f"🗓 tasks ({len(lines)}) · sshd {state}"
+    return "\n".join([header, *lines])[:3900] if lines else header + "\nno tasks found"
 
 
 def help_text() -> str:
@@ -2045,6 +2105,8 @@ def help_text() -> str:
         "engine-control commands:\n"
         "/status — roadmap, plan, usage, every step\n"
         "/workers — live workers + recent runs\n"
+        "/tasks — every automation Scheduled Task (news · engine · lab · "
+        "sshd starter) with status/last rc/next run, + ssh server state\n"
         "/why [step] — failure story (default: last halted)\n"
         "/retry [step] — resume BLOCKED/ABORTED steps in-place (work kept; "
         "replans from scratch only when the worktree is gone)\n"
@@ -2102,6 +2164,8 @@ def handle_commands(ctx, conn, tg, cmds):
             tg.send(status_text(ctx, conn))
         elif name == "/workers":
             tg.send(workers_text(ctx, conn))
+        elif name == "/tasks":
+            tg.send(tasks_text())
         elif name == "/pause":
             db.kv_set(conn, "paused", "1")
             db.kv_set(conn, "paused_why",
@@ -2546,7 +2610,7 @@ def main(argv=None):
     except (AttributeError, OSError):
         pass
     ap = argparse.ArgumentParser(prog="control.py")
-    ap.add_argument("cmd", choices=["tick", "start", "status", "workers", "why",
+    ap.add_argument("cmd", choices=["tick", "start", "status", "workers", "tasks", "why",
                                     "pause", "resume", "retry", "abort", "log", "init",
                                     "doctor", "install-task", "uninstall-task",
                                     "telegram-detect-chat", "news"])
@@ -2579,6 +2643,8 @@ def main(argv=None):
         print(status_text(ctx, conn))
     elif args.cmd == "workers":
         print(workers_text(ctx, conn))
+    elif args.cmd == "tasks":
+        print(tasks_text())
     elif args.cmd == "why":
         print(why_text(ctx, conn, args.target))
     elif args.cmd == "pause":

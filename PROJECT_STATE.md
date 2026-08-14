@@ -24,19 +24,33 @@ incident). `newsops.pause/resume` never raise — failures come back as chat
 text, so /pause always lands. Tests: TestPauseResume in test_news.py (fake
 `_app`/`_run`); test_workers' pause test stubs newsops.
 
-`/resume` also best-effort-starts the SSH server (`control.start_sshd`:
-`sc query`/`sc start sshd`, chat-text outcomes, never raises) — a reboot
-leaves the Manual-start sshd stopped and the owner locked out (hit live:
-reboot 8/13 19:31). The controller is unelevated, so the start only works
-after a ONE-TIME elevated service-ACL grant adding RP (start) for
-Interactive Users; run once in an admin shell (SD read from `sc sdshow
-sshd` 2026-08-14, with RP inserted into the IU ACE):
+`/resume` also starts the SSH server — a reboot leaves a Manual-start
+sshd stopped and the owner locked out (hit live: reboot 8/13 19:31, port
+22 dead ~18h; an Aug-8 sshd reinstall had reset StartType to Manual).
+Mechanism (`control.start_sshd`, live-verified 2026-08-14 end to end):
+the standing on-demand Scheduled Task `engine-control-start-sshd`
+(RunLevel HighestAvailable, action `sc start sshd` via hidden.vbs, no
+triggers) is registered ONCE from an elevated shell — after that the
+unelevated controller just `schtasks /run`s it and polls `sc query sshd`
+for RUNNING (~10s). The service-ACL-grant approach was abandoned:
+unelevated `sc start` is denied and `/rl HIGHEST` task creation is
+elevation-gated too, so ONE elevated step is unavoidable either way and
+the task keeps the service ACL untouched. Re-register (elevated;
+schtasks wants the XML re-encoded UTF-16):
 ```
-sc.exe sdset sshd "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"
+Get-Content scripts\start-sshd-task.xml -Raw | Set-Content $env:TEMP\s.xml -Encoding Unicode
+schtasks /create /tn engine-control-start-sshd /xml $env:TEMP\s.xml /f
 ```
-Also recommended: `Set-Service sshd -StartupType Automatic` so a reboot
-alone never strands SSH again (an Aug-8 sshd reinstall reset it to
-Manual, which is what caused the lockout).
+`Set-Service sshd -StartupType Automatic` is also applied (same elevated
+session, 2026-08-14), so a reboot alone never strands SSH again; the
+/resume start is the belt-and-braces recovery + phone-visible check.
+
+`/tasks` (Telegram + `control.py tasks`): one `schtasks /query /fo csv
+/v` pass filtered to `TASK_PREFIXES` (internet-discovery-/engine-
+control-/engine-lab-, shortened to news·/ec·/lab·), per-task
+status/last-rc/last-run/next-run, deduped across per-trigger rows and
+repeated per-folder header rows, plus a live `sc query sshd` state in
+the header. Never raises — failures come back as the message text.
 
 ## Implemented
 Tick orchestrator (Scheduled Task `engine-control-tick`, 1/min): `control.py`
