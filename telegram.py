@@ -23,9 +23,9 @@ SETUP_HELP = (
     "Use a DIFFERENT bot from the product discovery bot."
 )
 
-COMMANDS = ("/status", "/workers", "/pause", "/resume", "/retry", "/abort",
-            "/go", "/log", "/profile", "/pace", "/prs", "/why", "/news",
-            "/help", "/start")
+COMMANDS = ("/status", "/workers", "/tasks", "/pause", "/resume", "/retry",
+            "/abort", "/go", "/log", "/profile", "/pace", "/prs", "/why",
+            "/news", "/help", "/start")
 
 
 class Telegram:

@@ -182,22 +182,74 @@ class TestIdleReason(Base):
         def fake(returncode, stdout=""):
             return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
 
-        # already running: query says RUNNING, no start attempted
+        # already running: query says RUNNING, no task trigger pulled
         with mock.patch("subprocess.run",
                         side_effect=[fake(0, "STATE : 4  RUNNING")]) as m:
             self.assertEqual(control.start_sshd(), "ssh server already running")
             self.assertEqual(m.call_count, 1)
-        # stopped -> started
-        with mock.patch("subprocess.run",
-                        side_effect=[fake(0, "STATE : 1  STOPPED"), fake(0)]):
+        # stopped -> task triggered -> service comes up on the second poll
+        with mock.patch("time.sleep"), \
+             mock.patch("subprocess.run",
+                        side_effect=[fake(0, "STATE : 1  STOPPED"), fake(0),
+                                     fake(0, "STATE : 2  START_PENDING"),
+                                     fake(0, "STATE : 4  RUNNING")]) as m:
             self.assertEqual(control.start_sshd(), "ssh server started")
-        # stopped -> denied (unelevated, no ACL grant yet): chat text, no raise
+            self.assertEqual(m.call_args_list[1].args[0],
+                             ["schtasks", "/run", "/tn", control.SSHD_TASK])
+        # stopped -> task missing/denied: chat text with the fix, no raise
         with mock.patch("subprocess.run",
                         side_effect=[fake(0, "STATE : 1  STOPPED"),
-                                     fake(5, "Access is denied.")]):
+                                     fake(1, "ERROR: The system cannot find the task.")]):
             out = control.start_sshd()
-            self.assertIn("NOT started", out)
-            self.assertIn("ACL grant", out)
+            self.assertIn("ssh start task failed", out)
+            self.assertIn("re-register", out)
+
+    def test_tasks_text_filters_foreign_tasks_and_reports_sshd(self):
+        from unittest import mock
+        header = ('"HostName","TaskName","Next Run Time","Status",'
+                  '"Logon Mode","Last Run Time","Last Result"\n')
+        csv_out = (
+            header
+            + '"PC","\\internet-discovery-collect-web","8/14/2026 1:30:00 PM",'
+              '"Ready","Interactive","8/14/2026 1:29:00 PM","0"\n'
+            + '"PC","\\internet-discovery-collect-web","8/14/2026 1:30:00 PM",'
+              '"Ready","Interactive","8/14/2026 1:29:00 PM","0"\n'  # 2nd trigger row
+            + header  # schtasks repeats the header per task folder
+            + '"PC","\\OneDrive Standalone Update Task","N/A","Ready",'
+              '"Interactive","N/A","0"\n'
+            + '"PC","\\engine-control-start-sshd","N/A","Ready",'
+              '"Interactive","N/A","267011"\n'
+        )
+
+        def fake(args, **kw):
+            if args[0] == "schtasks":
+                return mock.Mock(returncode=0, stdout=csv_out, stderr="")
+            return mock.Mock(returncode=0, stdout="STATE : 1  STOPPED", stderr="")
+
+        with mock.patch("subprocess.run", side_effect=fake):
+            out = control.tasks_text()
+        self.assertIn("news·collect-web: Ready", out)
+        self.assertIn("ec·start-sshd: Ready", out)
+        self.assertNotIn("OneDrive", out)
+        self.assertIn("sshd STOPPED", out)
+        self.assertEqual(out.count("collect-web"), 1)  # deduped trigger rows
+
+    def test_tasks_command_routes_to_tasks_text(self):
+        conn = self.sb.conn()
+        sent = []
+
+        class T:
+            def send(self, t):
+                sent.append(t)
+
+        orig = control.tasks_text
+        control.tasks_text = lambda: "🗓 tasks (0) · sshd RUNNING"
+        try:
+            control.handle_commands(self.sb.ctx(), conn, T(), ["/tasks"])
+        finally:
+            control.tasks_text = orig
+        self.assertIn("🗓 tasks", sent[-1])
+        conn.close()
 
     def test_quota_hold_wins_over_ready(self):
         conn = self.sb.conn()
